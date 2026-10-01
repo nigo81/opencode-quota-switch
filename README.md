@@ -4,9 +4,13 @@ OpenCode v2 TUI 插件：**侧边栏自动跟随当前会话正在用的 provide
 
 切到 MiniMax 就显示 MiniMax，切到 GLM 就显示 GLM —— 不用手动切开关。
 
-![侧边栏效果](docs/screenshot.png)
+![GLM 面板](docs/screenshot-glm.png)
 
-> 面板长这样：标题行可点击折叠，右上角是本次抓取时间；下面是套餐信息，然后每个配额窗口三层（窗口名 / 半格进度条 / 重置倒计时）。
+*GLM：三窗口（5h · 周 · MCP）+ 套餐等级。窗口名 / 进度条 / 重置倒计时三层，标题行可点击折叠，右上角是本次抓取时间。*
+
+![MiniMax 面板](docs/screenshot.png)
+
+*MiniMax：同一个面板自动换成 MiniMax 的数据。周窗口显示 `∞` 是因为该档位不设限 —— 各家有多少窗口、显示什么，全由接口返回决定，插件不编造。*
 
 ## 支持的平台
 
