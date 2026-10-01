@@ -83,24 +83,31 @@ function registerSidebarSlot(
   api: TuiPluginApi,
   render: () => unknown,
 ): { ok: boolean; dispose?: () => void } {
-  const modern = (api.ui as { slot?: (cfg: Record<string, unknown>) => (() => void) | void }).slot
-  if (typeof modern === "function") {
-    trace("注册：走新代 api.ui.slot，槽名 sidebar.content")
-    const off = modern.call(api.ui, { prepend: "sidebar.content", render })
-    return { ok: true, dispose: typeof off === "function" ? off : undefined }
-  }
-  const register = api.slots?.register
-  if (typeof register !== "function") {
-    trace("注册失败：api.ui.slot 与 api.slots.register 都不存在")
+  try {
+    const modern = (api.ui as { slot?: (cfg: Record<string, unknown>) => (() => void) | void } | undefined)
+      ?.slot
+    if (typeof modern === "function") {
+      trace("注册：走新代 api.ui.slot，槽名 sidebar.content")
+      const off = modern.call(api.ui, { prepend: "sidebar.content", render })
+      return { ok: true, dispose: typeof off === "function" ? off : undefined }
+    }
+    trace(`注册：新代 api.ui.slot 不存在（api.ui=${api.ui === undefined ? "undefined" : typeof api.ui}）`)
+    const register = api.slots?.register
+    if (typeof register !== "function") {
+      trace("注册失败：api.ui.slot 与 api.slots.register 都不存在")
+      return { ok: false }
+    }
+    // 旧代 register 返回 string 句柄（插件 id），不是 disposer，故无可清理对象
+    trace("注册：走旧代 api.slots.register，槽名 sidebar_content")
+    register.call(api.slots, {
+      order: 40,
+      slots: { sidebar_content: render },
+    } as unknown as Parameters<typeof register>[0])
+    return { ok: true }
+  } catch (e) {
+    trace(`注册抛异常: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
     return { ok: false }
   }
-  // 旧代 register 返回 string 句柄（插件 id），不是 disposer，故无可清理对象
-  trace("注册：走旧代 api.slots.register，槽名 sidebar_content")
-  register.call(api.slots, {
-    order: 40,
-    slots: { sidebar_content: render },
-  } as unknown as Parameters<typeof register>[0])
-  return { ok: true }
 }
 
 /**
@@ -165,10 +172,12 @@ function whenRendererReady(api: TuiPluginApi, run: () => void): () => void {
 }
 
 const tui: TuiPlugin = async (api, options) => {
+ try {
   trace(`setup 开始 renderer.isRunning=${String(api.renderer?.isRunning)}`)
   const opts = readOptions(options as Record<string, unknown> | undefined)
   const intervalMs = Math.max(15_000, opts.intervalMs ?? 60_000)
   const providers = hostProviders(api)
+  trace(`hostProviders: ${providers.length} 个`)
   const allowed = opts.providers
   const candidates = availableAdapters(providers).filter(
     (a) => !allowed || allowed.length === 0 || allowed.some((n) => n === a.id || n === a.label),
@@ -262,6 +271,7 @@ const tui: TuiPlugin = async (api, options) => {
   })
 
   // 消息更新 = 可能换 provider；空闲 = 一次问答结束，两个都要重新判定
+  trace(`准备注册，candidates=${candidates.map((c) => c.id).join(",") || "(无)"}`)
   const offs = [
     api.event.on("message.updated", () => void load(sessionID, false)),
     api.event.on("session.updated", () => void load(sessionID, false)),
@@ -276,6 +286,12 @@ const tui: TuiPlugin = async (api, options) => {
     offRefresh()
     offs.forEach((off) => off())
   })
+  trace("setup 走完，未抛异常")
+ } catch (e) {
+  // 宿主调用 setup 时若抛异常，外层不会打印栈，排障全靠这里
+  trace(`setup 抛异常: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
+  throw e
+ }
 }
 
 /**

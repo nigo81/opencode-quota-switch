@@ -1231,23 +1231,29 @@ function hostProviders(api) {
   });
 }
 function registerSidebarSlot(api, render) {
-  const modern = api.ui.slot;
-  if (typeof modern === "function") {
-    trace("\u6CE8\u518C\uFF1A\u8D70\u65B0\u4EE3 api.ui.slot\uFF0C\u69FD\u540D sidebar.content");
-    const off = modern.call(api.ui, { prepend: "sidebar.content", render });
-    return { ok: true, dispose: typeof off === "function" ? off : void 0 };
-  }
-  const register = api.slots?.register;
-  if (typeof register !== "function") {
-    trace("\u6CE8\u518C\u5931\u8D25\uFF1Aapi.ui.slot \u4E0E api.slots.register \u90FD\u4E0D\u5B58\u5728");
+  try {
+    const modern = api.ui?.slot;
+    if (typeof modern === "function") {
+      trace("\u6CE8\u518C\uFF1A\u8D70\u65B0\u4EE3 api.ui.slot\uFF0C\u69FD\u540D sidebar.content");
+      const off = modern.call(api.ui, { prepend: "sidebar.content", render });
+      return { ok: true, dispose: typeof off === "function" ? off : void 0 };
+    }
+    trace(`\u6CE8\u518C\uFF1A\u65B0\u4EE3 api.ui.slot \u4E0D\u5B58\u5728\uFF08api.ui=${api.ui === void 0 ? "undefined" : typeof api.ui}\uFF09`);
+    const register = api.slots?.register;
+    if (typeof register !== "function") {
+      trace("\u6CE8\u518C\u5931\u8D25\uFF1Aapi.ui.slot \u4E0E api.slots.register \u90FD\u4E0D\u5B58\u5728");
+      return { ok: false };
+    }
+    trace("\u6CE8\u518C\uFF1A\u8D70\u65E7\u4EE3 api.slots.register\uFF0C\u69FD\u540D sidebar_content");
+    register.call(api.slots, {
+      order: 40,
+      slots: { sidebar_content: render }
+    });
+    return { ok: true };
+  } catch (e) {
+    trace(`\u6CE8\u518C\u629B\u5F02\u5E38: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
     return { ok: false };
   }
-  trace("\u6CE8\u518C\uFF1A\u8D70\u65E7\u4EE3 api.slots.register\uFF0C\u69FD\u540D sidebar_content");
-  register.call(api.slots, {
-    order: 40,
-    slots: { sidebar_content: render }
-  });
-  return { ok: true };
 }
 function registerRefreshCommand(api, refresh) {
   const layer = api.keymap.layer;
@@ -1306,101 +1312,110 @@ function whenRendererReady(api, run) {
   };
 }
 var tui = async (api, options) => {
-  trace(`setup \u5F00\u59CB renderer.isRunning=${String(api.renderer?.isRunning)}`);
-  const opts = readOptions(options);
-  const intervalMs = Math.max(15e3, opts.intervalMs ?? 6e4);
-  const providers = hostProviders(api);
-  const allowed = opts.providers;
-  const candidates = availableAdapters(providers).filter(
-    (a) => !allowed || allowed.length === 0 || allowed.some((n) => n === a.id || n === a.label)
-  );
-  const [snapshot, setSnapshot] = createSignal2(null);
-  const [title, setTitle] = createSignal2(opts.title ?? "\u5957\u9910\u7528\u91CF");
-  const [refreshTick, setRefreshTick] = createSignal2(0);
-  function activeAdapter(sessionID2) {
-    const messages = sessionID2 ? api.state.session.messages(sessionID2) : [];
-    const active = resolveActiveProvider({ messages, config: api.state.config });
-    const byId = active.providerID ? adapterForProviderId(active.providerID) : void 0;
-    const fallback = candidates[0];
-    const chosen = byId && candidates.includes(byId) ? byId : byId ?? fallback;
-    return chosen;
-  }
-  let lastFetch = 0;
-  let inFlight = false;
-  async function load(sessionID2, force) {
-    const now = Date.now();
-    if (!force && now - lastFetch < intervalMs - 1e3) return;
-    if (inFlight) return;
-    const adapter = activeAdapter(sessionID2);
-    if (!adapter) {
-      trace("load\uFF1A\u672A\u627E\u5230\u53EF\u7528 adapter");
-      setSnapshot({ provider: "\u2014", ok: false, error: "\u672A\u627E\u5230\u53EF\u7528\u7684\u5957\u9910 provider", fetchedAt: now });
-      return;
+  try {
+    let activeAdapter2 = function(sessionID2) {
+      const messages = sessionID2 ? api.state.session.messages(sessionID2) : [];
+      const active = resolveActiveProvider({ messages, config: api.state.config });
+      const byId = active.providerID ? adapterForProviderId(active.providerID) : void 0;
+      const fallback = candidates[0];
+      const chosen = byId && candidates.includes(byId) ? byId : byId ?? fallback;
+      return chosen;
+    };
+    var activeAdapter = activeAdapter2;
+    trace(`setup \u5F00\u59CB renderer.isRunning=${String(api.renderer?.isRunning)}`);
+    const opts = readOptions(options);
+    const intervalMs = Math.max(15e3, opts.intervalMs ?? 6e4);
+    const providers = hostProviders(api);
+    trace(`hostProviders: ${providers.length} \u4E2A`);
+    const allowed = opts.providers;
+    const candidates = availableAdapters(providers).filter(
+      (a) => !allowed || allowed.length === 0 || allowed.some((n) => n === a.id || n === a.label)
+    );
+    const [snapshot, setSnapshot] = createSignal2(null);
+    const [title, setTitle] = createSignal2(opts.title ?? "\u5957\u9910\u7528\u91CF");
+    const [refreshTick, setRefreshTick] = createSignal2(0);
+    let lastFetch = 0;
+    let inFlight = false;
+    async function load(sessionID2, force) {
+      const now = Date.now();
+      if (!force && now - lastFetch < intervalMs - 1e3) return;
+      if (inFlight) return;
+      const adapter = activeAdapter2(sessionID2);
+      if (!adapter) {
+        trace("load\uFF1A\u672A\u627E\u5230\u53EF\u7528 adapter");
+        setSnapshot({ provider: "\u2014", ok: false, error: "\u672A\u627E\u5230\u53EF\u7528\u7684\u5957\u9910 provider", fetchedAt: now });
+        return;
+      }
+      inFlight = true;
+      lastFetch = now;
+      try {
+        const quota = await fetchQuota(adapter, providers);
+        trace(`load \u6210\u529F provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`);
+        setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        trace(`load \u5931\u8D25 provider=${adapter.label} err=${msg}`);
+        setSnapshot({
+          provider: adapter.label,
+          ok: false,
+          error: msg,
+          fetchedAt: now
+        });
+      } finally {
+        inFlight = false;
+      }
     }
-    inFlight = true;
-    lastFetch = now;
-    try {
-      const quota = await fetchQuota(adapter, providers);
-      trace(`load \u6210\u529F provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`);
-      setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      trace(`load \u5931\u8D25 provider=${adapter.label} err=${msg}`);
-      setSnapshot({
-        provider: adapter.label,
-        ok: false,
-        error: msg,
-        fetchedAt: now
+    let sessionID;
+    const render = (slotProps) => {
+      const props = asRecord3(slotProps);
+      const next = typeof props?.session_id === "string" ? props.session_id : sessionID;
+      if (next !== sessionID) {
+        sessionID = next;
+        setTitle(`${activeAdapter2(sessionID)?.label ?? "\u5957\u9910"} \u989D\u5EA6`);
+        void load(sessionID, true);
+      }
+      trace(`render \u88AB\u8C03\u7528 session=${next ?? "(none)"}`);
+      return createComponent(QuotaPanel, {
+        snapshot,
+        title,
+        theme: api.theme,
+        kv: api.kv,
+        refreshSignal: refreshTick,
+        version: PLUGIN_VERSION
       });
-    } finally {
-      inFlight = false;
-    }
-  }
-  let sessionID;
-  const render = (slotProps) => {
-    const props = asRecord3(slotProps);
-    const next = typeof props?.session_id === "string" ? props.session_id : sessionID;
-    if (next !== sessionID) {
-      sessionID = next;
-      setTitle(`${activeAdapter(sessionID)?.label ?? "\u5957\u9910"} \u989D\u5EA6`);
+    };
+    const stopReady = whenRendererReady(api, () => {
+      const { ok, dispose } = registerSidebarSlot(api, render);
+      if (!ok) {
+        api.ui.toast({ variant: "error", message: "quota-switch: \u672A\u80FD\u6CE8\u518C sidebar \u63D2\u69FD" });
+      } else if (dispose) {
+        api.lifecycle.onDispose(dispose);
+      }
+      setTitle(`${activeAdapter2(sessionID)?.label ?? "\u5957\u9910"} \u989D\u5EA6`);
       void load(sessionID, true);
-    }
-    trace(`render \u88AB\u8C03\u7528 session=${next ?? "(none)"}`);
-    return createComponent(QuotaPanel, {
-      snapshot,
-      title,
-      theme: api.theme,
-      kv: api.kv,
-      refreshSignal: refreshTick,
-      version: PLUGIN_VERSION
     });
-  };
-  const stopReady = whenRendererReady(api, () => {
-    const { ok, dispose } = registerSidebarSlot(api, render);
-    if (!ok) {
-      api.ui.toast({ variant: "error", message: "quota-switch: \u672A\u80FD\u6CE8\u518C sidebar \u63D2\u69FD" });
-    } else if (dispose) {
-      api.lifecycle.onDispose(dispose);
-    }
-    setTitle(`${activeAdapter(sessionID)?.label ?? "\u5957\u9910"} \u989D\u5EA6`);
-    void load(sessionID, true);
-  });
-  const offRefresh = registerRefreshCommand(api, () => {
-    setRefreshTick(Date.now());
-    void load(sessionID, true);
-  });
-  const offs = [
-    api.event.on("message.updated", () => void load(sessionID, false)),
-    api.event.on("session.updated", () => void load(sessionID, false)),
-    api.event.on("session.idle", () => void load(sessionID, true))
-  ].filter((off) => typeof off === "function");
-  const timer = setInterval(() => void load(sessionID, false), intervalMs);
-  api.lifecycle.onDispose(() => {
-    clearInterval(timer);
-    stopReady();
-    offRefresh();
-    offs.forEach((off) => off());
-  });
+    const offRefresh = registerRefreshCommand(api, () => {
+      setRefreshTick(Date.now());
+      void load(sessionID, true);
+    });
+    trace(`\u51C6\u5907\u6CE8\u518C\uFF0Ccandidates=${candidates.map((c) => c.id).join(",") || "(\u65E0)"}`);
+    const offs = [
+      api.event.on("message.updated", () => void load(sessionID, false)),
+      api.event.on("session.updated", () => void load(sessionID, false)),
+      api.event.on("session.idle", () => void load(sessionID, true))
+    ].filter((off) => typeof off === "function");
+    const timer = setInterval(() => void load(sessionID, false), intervalMs);
+    api.lifecycle.onDispose(() => {
+      clearInterval(timer);
+      stopReady();
+      offRefresh();
+      offs.forEach((off) => off());
+    });
+    trace("setup \u8D70\u5B8C\uFF0C\u672A\u629B\u5F02\u5E38");
+  } catch (e) {
+    trace(`setup \u629B\u5F02\u5E38: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+    throw e;
+  }
 };
 var main_default = { id: "quota-switch", tui, setup: tui };
 export {
