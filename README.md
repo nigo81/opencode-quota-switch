@@ -66,7 +66,8 @@ src/ui/panel.tsx         Solid 面板渲染
 ```jsonc
 {
   "plugins": [
-    { "package": "./plugins/opencode-quota-switch",
+    "opencode-quota-switch",
+    { "package": "opencode-quota-switch",
       "options": { "intervalMs": 60000, "providers": ["GLM", "MiniMax"] } }
   ]
 }
@@ -78,12 +79,48 @@ src/ui/panel.tsx         Solid 面板渲染
 | `providers` | 全部 | 白名单，值为 adapter id 或展示名 |
 | `title` | 按 provider 自动 | 面板标题前缀 |
 
+## 安装
+
+### 方式一：本地安装脚本（推荐，改代码即时生效）
+
+```bash
+git clone https://github.com/nigo81/opencode-quota-switch.git
+cd opencode-quota-switch
+npm install && npm run build
+./install.sh
+```
+
+`install.sh` 会把仓库软链进 OpenCode 的 TUI 插件缓存（`~/.cache/opencode/npm/`）并在 `cli.json` 注册裸包名。改完代码重跑 `npm run build && ./install.sh` 再重启 OpenCode 即可生效，无需重新发布。
+
+### 方式二：git specifier
+
+```bash
+opencode plugin add https://github.com/nigo81/opencode-quota-switch.git
+```
+
+> ⚠️ **已知问题（opencode 2.0.21）**：这条路径会失败并报
+> `NpmInstallFailedError: git dep preparation failed`。
+> 同一个 git 依赖用 npm 1.3.14 与 bun 1.3.14 单独安装都成功，故是宿主安装器自身的问题。
+> 方式一不受影响。
+
+### 卸载
+
+```bash
+opencode plugin remove opencode-quota-switch
+rm -rf ~/.cache/opencode/npm/opencode-quota-switch@latest
+```
+
 ## 开发
 
 ```bash
 npm install
-npx tsc --noEmit
+npm run build          # tsc --noEmit + esbuild 打包成 dist/tui.js
+npm run typecheck
 ```
+
+**发布形态是预打包的 `dist/tui.js`，不是裸 TS 源码**——这是实测踩出来的：宿主加载 npm 缓存中的 TUI 插件走「已打包产物」的解析路径，直接发 `main.ts` 会报
+`Cannot find package 'solid-js' imported from .../src/ui/panel.tsx`。
+打包配置见 `build.mjs`，其中 Solid 编译必须用 `generate: "universal"` + `moduleName: "@opentui/solid"`（默认是 `solid-js/web`，那是 DOM 那套，渲染到 opentui 上不显示）。
 
 `reference/` 存放上游 `opencode-quota-usage@0.3.7` 的原始文件，仅供对照，不参与编译也不发布。
 
