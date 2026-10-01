@@ -5,6 +5,8 @@
  * 判定逻辑在 ./src/active-provider（零依赖纯函数），取数在 ./src/providers，界面在 ./src/ui。
  */
 import { createSignal } from "solid-js"
+import { createComponent } from "@opentui/solid"
+import fs from "node:fs"
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { resolveActiveProvider } from "./src/active-provider.js"
 import { availableAdapters, adapterForProviderId, fetchQuota } from "./src/providers/index.js"
@@ -13,6 +15,22 @@ import type { ProviderLike, QuotaSnapshot } from "./src/types.js"
 
 /** 面板头部显示的版本号，与 package.json 保持一致 */
 const PLUGIN_VERSION = "0.1.0"
+
+/**
+ * 排障 trace：宿主加载 TUI 插件时，槽位注册与渲染这两阶段不写任何日志，
+ * 面板不显示时无法从 opencode.log 区分「没加载 / 没注册 / 没渲染」。
+ * 这里同步追加到文件（appendFileSync 不会被进程退出吞掉）。
+ * 排障完成后可整段删除。
+ */
+const TRACE_FILE = "/tmp/opencode-quota-switch.log"
+function trace(msg: string): void {
+  try {
+    fs.appendFileSync(TRACE_FILE, `[${new Date().toISOString()}] ${msg}\n`)
+  } catch {
+    /* trace 失败不影响插件功能 */
+  }
+}
+trace("=== 模块加载 ===")
 
 type SwitchOptions = {
   /** 白名单，空/缺省 = 全部启用。值是 adapter id 或展示名 */
@@ -67,12 +85,17 @@ function registerSidebarSlot(
 ): { ok: boolean; dispose?: () => void } {
   const modern = (api.ui as { slot?: (cfg: Record<string, unknown>) => (() => void) | void }).slot
   if (typeof modern === "function") {
+    trace("注册：走新代 api.ui.slot，槽名 sidebar.content")
     const off = modern.call(api.ui, { prepend: "sidebar.content", render })
     return { ok: true, dispose: typeof off === "function" ? off : undefined }
   }
   const register = api.slots?.register
-  if (typeof register !== "function") return { ok: false }
+  if (typeof register !== "function") {
+    trace("注册失败：api.ui.slot 与 api.slots.register 都不存在")
+    return { ok: false }
+  }
   // 旧代 register 返回 string 句柄（插件 id），不是 disposer，故无可清理对象
+  trace("注册：走旧代 api.slots.register，槽名 sidebar_content")
   register.call(api.slots, {
     order: 40,
     slots: { sidebar_content: render },
@@ -142,6 +165,7 @@ function whenRendererReady(api: TuiPluginApi, run: () => void): () => void {
 }
 
 const tui: TuiPlugin = async (api, options) => {
+  trace(`setup 开始 renderer.isRunning=${String(api.renderer?.isRunning)}`)
   const opts = readOptions(options as Record<string, unknown> | undefined)
   const intervalMs = Math.max(15_000, opts.intervalMs ?? 60_000)
   const providers = hostProviders(api)
@@ -173,6 +197,7 @@ const tui: TuiPlugin = async (api, options) => {
     if (inFlight) return
     const adapter = activeAdapter(sessionID)
     if (!adapter) {
+      trace("load：未找到可用 adapter")
       setSnapshot({ provider: "—", ok: false, error: "未找到可用的套餐 provider", fetchedAt: now })
       return
     }
@@ -180,12 +205,15 @@ const tui: TuiPlugin = async (api, options) => {
     lastFetch = now
     try {
       const quota = await fetchQuota(adapter, providers)
+      trace(`load 成功 provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`)
       setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now })
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      trace(`load 失败 provider=${adapter.label} err=${msg}`)
       setSnapshot({
         provider: adapter.label,
         ok: false,
-        error: e instanceof Error ? e.message : String(e),
+        error: msg,
         fetchedAt: now,
       })
     } finally {
@@ -203,7 +231,10 @@ const tui: TuiPlugin = async (api, options) => {
       setTitle(`${activeAdapter(sessionID)?.label ?? "套餐"} 额度`)
       void load(sessionID, true)
     }
-    return QuotaPanel({
+    // 必须经 createComponent 在宿主的响应式 owner 内实例化。
+    // 直接调用 QuotaPanel({...}) 不会建立 owner，组件不渲染（实测踩过）。
+    trace(`render 被调用 session=${next ?? "(none)"}`)
+    return createComponent(QuotaPanel, {
       snapshot,
       title,
       theme: api.theme,

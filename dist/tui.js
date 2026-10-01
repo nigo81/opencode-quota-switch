@@ -1,5 +1,7 @@
 // main.ts
 import { createSignal as createSignal2 } from "solid-js";
+import { createComponent } from "@opentui/solid";
+import fs from "node:fs";
 
 // src/active-provider.ts
 function asRecord(v) {
@@ -1194,6 +1196,15 @@ function QuotaPanel(props) {
 
 // main.ts
 var PLUGIN_VERSION = "0.1.0";
+var TRACE_FILE = "/tmp/opencode-quota-switch.log";
+function trace(msg) {
+  try {
+    fs.appendFileSync(TRACE_FILE, `[${(/* @__PURE__ */ new Date()).toISOString()}] ${msg}
+`);
+  } catch {
+  }
+}
+trace("=== \u6A21\u5757\u52A0\u8F7D ===");
 function readOptions(raw) {
   const num = (v) => typeof v === "number" && Number.isFinite(v) ? v : void 0;
   const str = (v) => typeof v === "string" ? v : void 0;
@@ -1222,11 +1233,16 @@ function hostProviders(api) {
 function registerSidebarSlot(api, render) {
   const modern = api.ui.slot;
   if (typeof modern === "function") {
+    trace("\u6CE8\u518C\uFF1A\u8D70\u65B0\u4EE3 api.ui.slot\uFF0C\u69FD\u540D sidebar.content");
     const off = modern.call(api.ui, { prepend: "sidebar.content", render });
     return { ok: true, dispose: typeof off === "function" ? off : void 0 };
   }
   const register = api.slots?.register;
-  if (typeof register !== "function") return { ok: false };
+  if (typeof register !== "function") {
+    trace("\u6CE8\u518C\u5931\u8D25\uFF1Aapi.ui.slot \u4E0E api.slots.register \u90FD\u4E0D\u5B58\u5728");
+    return { ok: false };
+  }
+  trace("\u6CE8\u518C\uFF1A\u8D70\u65E7\u4EE3 api.slots.register\uFF0C\u69FD\u540D sidebar_content");
   register.call(api.slots, {
     order: 40,
     slots: { sidebar_content: render }
@@ -1290,6 +1306,7 @@ function whenRendererReady(api, run) {
   };
 }
 var tui = async (api, options) => {
+  trace(`setup \u5F00\u59CB renderer.isRunning=${String(api.renderer?.isRunning)}`);
   const opts = readOptions(options);
   const intervalMs = Math.max(15e3, opts.intervalMs ?? 6e4);
   const providers = hostProviders(api);
@@ -1316,6 +1333,7 @@ var tui = async (api, options) => {
     if (inFlight) return;
     const adapter = activeAdapter(sessionID2);
     if (!adapter) {
+      trace("load\uFF1A\u672A\u627E\u5230\u53EF\u7528 adapter");
       setSnapshot({ provider: "\u2014", ok: false, error: "\u672A\u627E\u5230\u53EF\u7528\u7684\u5957\u9910 provider", fetchedAt: now });
       return;
     }
@@ -1323,12 +1341,15 @@ var tui = async (api, options) => {
     lastFetch = now;
     try {
       const quota = await fetchQuota(adapter, providers);
+      trace(`load \u6210\u529F provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`);
       setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now });
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      trace(`load \u5931\u8D25 provider=${adapter.label} err=${msg}`);
       setSnapshot({
         provider: adapter.label,
         ok: false,
-        error: e instanceof Error ? e.message : String(e),
+        error: msg,
         fetchedAt: now
       });
     } finally {
@@ -1344,7 +1365,8 @@ var tui = async (api, options) => {
       setTitle(`${activeAdapter(sessionID)?.label ?? "\u5957\u9910"} \u989D\u5EA6`);
       void load(sessionID, true);
     }
-    return QuotaPanel({
+    trace(`render \u88AB\u8C03\u7528 session=${next ?? "(none)"}`);
+    return createComponent(QuotaPanel, {
       snapshot,
       title,
       theme: api.theme,
