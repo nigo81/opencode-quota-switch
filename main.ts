@@ -8,7 +8,7 @@ import { createSignal } from "solid-js"
 import { createComponent } from "@opentui/solid"
 import fs from "node:fs"
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { detectActiveProvider } from "./src/active-provider.js"
+import { detectActiveProvider, dumpApiSurface } from "./src/active-provider.js"
 import { authFileProviders, authFileTrace } from "./src/authfile.js"
 import { availableAdapters, adapterForProviderId, fetchQuota } from "./src/providers/index.js"
 import { QuotaPanel } from "./src/ui/index.js"
@@ -249,10 +249,21 @@ const tui: TuiPlugin = async (api, options) => {
     if (probeInFlight) return
     probeInFlight = true
     try {
-      const r = await detectActiveProvider(api)
+      // 白名单 = 本插件实际拿得到凭证的 opencode providerID（如 minimax-cn-coding-plan），
+      // 探测结果必须落在这个集合内才采信，否则 api.data.session.status() 的 "idle" 之类会被当 provider
+      const known = getProviders()
+        .map((p) => p.id)
+        .filter((x): x is string => typeof x === "string" && x !== "")
+      const r = await detectActiveProvider(api, [], known)
       r.notes.forEach((n) => trace(`  探测: ${n}`))
+      // 探测失败时保留上一次成功的值。之前这里无条件覆盖成 undefined，
+      // activeAdapter() 于是回落到 candidates[0]（GLM），面板每 3s 闪一次。
+      if (r.providerID === undefined) {
+        trace(`探测未命中，沿用上次结果 ${detectedProviderID ?? "(无，仍显示默认)"}`)
+        return
+      }
       if (r.providerID !== detectedProviderID) {
-        trace(`活跃 provider: ${detectedProviderID ?? "(无)"} → ${r.providerID ?? "(仍未探到)"}`)
+        trace(`活跃 provider: ${detectedProviderID ?? "(无)"} → ${r.providerID}`)
         detectedProviderID = r.providerID
       }
     } catch (e) {
@@ -393,6 +404,11 @@ const tui: TuiPlugin = async (api, options) => {
       }
     })()
   }, 3000)
+
+  // 一次性把 API 形状打进 trace，setup 阶段跑一次就够
+  void dumpApiSurface(api)
+    .then((lines) => lines.forEach((l) => trace(`API ${l}`)))
+    .catch((e) => trace(`dumpApiSurface 抛异常: ${e instanceof Error ? e.message : String(e)}`))
 
   const dispose = (): void => {
     clearInterval(timer)

@@ -7,54 +7,138 @@ import fs2 from "node:fs";
 function rec(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v) ? v : void 0;
 }
-function shapeOf(v, depth = 0) {
-  if (v === null) return "null";
-  if (v === void 0) return "undefined";
-  if (Array.isArray(v)) {
-    if (v.length === 0) return "[]";
-    return `array(${v.length})<${shapeOf(v[0], depth + 1)}>`;
+function pickMostViewedSession(list) {
+  let best;
+  for (const item of list) {
+    const s = rec(item);
+    if (!s) continue;
+    const score = sessionTimeScore(s);
+    if (!score) continue;
+    if (!best || score.t > best.t) best = { s, t: score.t, by: score.by };
   }
-  if (typeof v === "function") return "function";
-  if (typeof v !== "object") return typeof v;
-  if (depth >= 2) return "{\u2026}";
-  return `{${Object.keys(v).slice(0, 12).map((k) => `${k}:${shapeOf(v[k], depth + 1)}`).join(",")}}`;
+  if (!best) return void 0;
+  const id = typeof best.s.id === "string" ? best.s.id : void 0;
+  return { session: best.s, id, rankBy: best.by };
 }
-function pickProviderIDFromModelLike(m) {
+function sessionTimeScore(s) {
+  const t = s.time;
+  if (typeof t === "number") return { t, by: "time" };
+  const r = rec(t);
+  if (!r) return void 0;
+  for (const k of ["viewed", "updated", "created"]) {
+    const v = r[k];
+    if (typeof v === "number") return { t: v, by: `time.${k}` };
+  }
+  for (const k of Object.keys(r)) {
+    const v = r[k];
+    if (typeof v === "number") return { t: v, by: `time.${k}` };
+  }
+  return void 0;
+}
+function keyList(v) {
+  const r = rec(v);
+  return r ? Object.keys(r).join(",") : typeof v;
+}
+function pickProviderIDFromModelLike(m, known) {
+  if (typeof m === "string") return providerIDFromModelString(m, known);
   const r = rec(m);
   if (!r) return void 0;
   for (const key of ["providerID", "providerId", "provider_id"]) {
     const v = r[key];
     if (typeof v === "string" && v !== "") return v;
   }
-  const info = rec(r.info);
-  if (info) {
-    for (const key of ["providerID", "providerId"]) {
-      const v = info[key];
-      if (typeof v === "string" && v !== "") return v;
-    }
+  for (const key of ["info", "model"]) {
+    const sub = rec(r[key]);
+    if (!sub) continue;
+    const v = pickProviderIDFromModelLike(sub, known);
+    if (v) return v;
   }
-  for (const key of ["modelID", "modelId", "id"]) {
+  for (const key of ["modelID", "modelId", "id", "name", "label"]) {
     const v = r[key];
-    if (typeof v === "string" && v.includes("/")) return v.split("/")[0];
+    if (typeof v === "string" && v !== "") {
+      const fromString = providerIDFromModelString(v, known);
+      if (fromString) return fromString;
+    }
   }
   return void 0;
 }
-function providerIDFromMessages(messages) {
+function providerIDFromModelString(s, known) {
+  const t = s.trim();
+  if (!looksLikeProviderID(t)) return void 0;
+  const slash = t.indexOf("/");
+  if (slash > 0) return t.slice(0, slash);
+  if (known?.includes(t)) return t;
+  return void 0;
+}
+function looksLikeProviderID(s) {
+  if (s === "" || s.length > 80) return false;
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*(\/[a-zA-Z0-9._-]+)*$/.test(s)) return false;
+  for (const p of ["ses_", "msg_", "prt_", "per_", "cmt_"]) if (s.startsWith(p)) return false;
+  return true;
+}
+function providerIDFromMessages(payload, known) {
+  const messages = Array.isArray(payload) ? payload : rec(payload)?.data;
   if (!Array.isArray(messages)) return void 0;
   for (let i = messages.length - 1; i >= 0; i--) {
     const r = rec(messages[i]);
     if (!r) continue;
-    const direct = pickProviderIDFromModelLike(r);
-    if (direct) return direct;
-    const info = rec(r.info);
-    if (info) {
-      const v = pickProviderIDFromModelLike(info);
-      if (v) return v;
+    const info = rec(r.info) ?? r;
+    for (const key of ["providerID", "providerId"]) {
+      const v = info[key];
+      if (typeof v === "string" && v !== "") return v;
+    }
+    const modelStr = info.modelID ?? info.modelId;
+    if (typeof modelStr === "string") {
+      const fromString = providerIDFromModelString(modelStr, known);
+      if (fromString) return fromString;
     }
   }
   return void 0;
 }
-async function detectActiveProvider(api, preferIDs = []) {
+async function dumpApiSurface(api) {
+  const out = [];
+  const a = rec(api) ?? {};
+  const shape = (label, v) => out.push(`  ${label} = ${keyList(v)}`);
+  shape("api.storage.store", rec(a.storage)?.store);
+  shape("api.storage.memory", rec(a.storage)?.memory);
+  shape("api.data.session", rec(a.data)?.session);
+  shape("api.data.project", rec(a.data)?.project);
+  shape("api.location", a.location);
+  shape("api.attention", a.attention);
+  shape("api.app", a.app);
+  shape("api.renderer", a.renderer);
+  shape("api.ui.panel", rec(a.ui)?.panel);
+  shape("api.ui.tabs", rec(a.ui)?.tabs);
+  const client = rec(a.client) ?? {};
+  const listFn = rec(client.session)?.list;
+  if (typeof listFn === "function") {
+    try {
+      const list = await listFn.call(rec(client.session));
+      const arr = Array.isArray(list) ? list : rec(list)?.data ?? [];
+      out.push(`  session.list()[0] keys = ${keyList(arr[0])}`);
+      out.push(`  session.list()[0].time = ${JSON.stringify(rec(arr[0])?.time ?? null)}`);
+      if (arr.length > 1) out.push(`  session.list()[1] keys = ${keyList(arr[1])}`);
+    } catch (e) {
+      out.push(`  session.list() \u629B\u5F02\u5E38: ${e instanceof Error ? e.message.split("\n")[0] : "?"}`);
+    }
+  }
+  const store = rec(a.storage)?.store ?? void 0;
+  for (const key of Object.keys(store ?? {})) {
+    const fn = store[key];
+    if (typeof fn !== "function") {
+      out.push(`  storage.store.${key} = ${typeof fn}`);
+      continue;
+    }
+    try {
+      const v = await fn.call(store);
+      out.push(`  storage.store.${key}() = ${typeof v === "string" ? v : keyList(v)}`);
+    } catch (e) {
+      out.push(`  storage.store.${key}() \u629B\u5F02\u5E38: ${e instanceof Error ? e.message.split("\n")[0] : "?"}`);
+    }
+  }
+  return out;
+}
+async function detectActiveProvider(api, preferIDs = [], known = []) {
   const notes = [];
   for (const id of preferIDs) {
     if (typeof id === "string" && id !== "") {
@@ -67,53 +151,51 @@ async function detectActiveProvider(api, preferIDs = []) {
   const client = rec(a.client) ?? {};
   const uiModel = rec(ui.model) ?? {};
   for (const key of ["current", "selected", "active", "value"]) {
-    const id = pickProviderIDFromModelLike(uiModel[key]);
+    const id = pickProviderIDFromModelLike(uiModel[key], known);
     if (id) {
       notes.push(`api.ui.model.${key} \u2192 ${id}`);
       return { providerID: id, notes };
     }
   }
-  notes.push(`api.ui.model \u6210\u5458=[${Object.keys(uiModel).join(",")}] \u65E0 current/selected`);
   const sessionNS = rec(client.session) ?? {};
-  try {
-    const listFn = sessionNS.list;
-    if (typeof listFn === "function") {
+  const listFn = sessionNS.list;
+  if (typeof listFn === "function") {
+    try {
       const list = await listFn.call(sessionNS);
       const arr = Array.isArray(list) ? list : rec(list)?.data ?? [];
-      const first = rec(arr[0]);
-      const infoRec = rec(first?.info);
-      const sid = first?.id ?? first?.sessionID ?? infoRec?.id;
-      if (typeof sid === "string") {
-        const getFn = sessionNS.get;
-        if (typeof getFn === "function") {
-          const s = await getFn.call(sessionNS, sid);
-          const id = providerIDFromMessages(rec(s)?.messages);
-          if (id) {
-            notes.push(`api.client.session.get(${sid}) \u6700\u8FD1\u6D88\u606F \u2192 ${id}`);
-            return { providerID: id, notes };
-          }
-          notes.push(`api.client.session.get(${sid}) \u6D88\u606F\u91CC\u6CA1\u6709 providerID\uFF08shape=${shapeOf(s)}\uFF09`);
-        }
-      } else {
-        notes.push(`api.client.session.list() \u62FF\u4E0D\u5230 session id\uFF08shape=${shapeOf(list)}\uFF09`);
+      const best = pickMostViewedSession(arr);
+      const id = pickProviderIDFromModelLike(best?.session, known);
+      if (id) {
+        const top = arr.map((s) => {
+          const r = rec(s) ?? {};
+          const sc = sessionTimeScore(r);
+          return sc ? { id: String(r.id ?? "?").slice(-6), t: sc.t, by: sc.by } : void 0;
+        }).filter((x) => x !== void 0).sort((x, y) => y.t - x.t).slice(0, 3).map((x) => `${x.id}:${x.by}=${x.t}`).join(" ");
+        notes.push(
+          `client.session.list() ${arr.length} \u6761 \u2192 \u5F53\u524D\u4F1A\u8BDD \u2026${best?.id?.slice(-6)} (${best?.rankBy}) \u2192 ${id} | top3 ${top}`
+        );
+        return { providerID: id, notes };
       }
-    } else {
-      notes.push(`api.client.session \u65E0 list()\uFF0C\u6210\u5458=[${Object.keys(sessionNS).join(",")}]`);
+      notes.push(`client.session.list() ${arr.length} \u6761\u91CC\u6CA1\u6709 model \u5B57\u6BB5\uFF08keys=${keyList(best?.session)}\uFF09`);
+    } catch (e) {
+      notes.push(`client.session.list \u629B\u5F02\u5E38: ${e instanceof Error ? e.message.split("\n")[0] : "?"}`);
     }
-  } catch (e) {
-    notes.push(`api.client.session \u629B\u5F02\u5E38: ${e instanceof Error ? e.message : String(e)}`);
   }
   try {
     const dataSession = rec(rec(a.data)?.session) ?? {};
     for (const key of Object.keys(dataSession)) {
       const v = dataSession[key];
-      if (typeof v === "function" && key !== "get" && key !== "select") {
-        const r = await v.call(dataSession);
-        const id = pickProviderIDFromModelLike(r) ?? providerIDFromMessages(r);
-        if (id) {
-          notes.push(`api.data.session.${key}() \u2192 ${id}`);
-          return { providerID: id, notes };
-        }
+      if (typeof v !== "function" || key === "get" || key === "select") continue;
+      let r;
+      try {
+        r = await v.call(dataSession);
+      } catch {
+        continue;
+      }
+      const id = pickProviderIDFromModelLike(r, known) ?? providerIDFromMessages(r, known);
+      if (id) {
+        notes.push(`api.data.session.${key}() \u2192 ${id}`);
+        return { providerID: id, notes };
       }
     }
     notes.push(`api.data.session \u6210\u5458=[${Object.keys(dataSession).join(",")}] \u672A\u547D\u4E2D`);
@@ -122,13 +204,13 @@ async function detectActiveProvider(api, preferIDs = []) {
   }
   try {
     const modelNS = rec(client.model) ?? {};
-    const listFn = modelNS.list ?? modelNS.available;
-    if (typeof listFn === "function") {
-      const list = await listFn.call(modelNS);
+    const listFn2 = modelNS.list ?? modelNS.available;
+    if (typeof listFn2 === "function") {
+      const list = await listFn2.call(modelNS);
       const arr = Array.isArray(list) ? list : [];
       const ids = /* @__PURE__ */ new Set();
       for (const m of arr) {
-        const id = pickProviderIDFromModelLike(m);
+        const id = pickProviderIDFromModelLike(m, known);
         if (id) ids.add(id);
       }
       notes.push(`api.client.model \u5217\u8868\u91CC\u51FA\u73B0\u7684 providerID=[${[...ids].join(",")}]\uFF08\u65E0\u300C\u5F53\u524D\u300D\u8BED\u4E49\uFF0C\u4EC5\u4F9B\u5BF9\u7167\uFF09`);
@@ -1521,10 +1603,15 @@ var tui = async (api, options) => {
       if (probeInFlight) return;
       probeInFlight = true;
       try {
-        const r = await detectActiveProvider(api);
+        const known = getProviders().map((p) => p.id).filter((x) => typeof x === "string" && x !== "");
+        const r = await detectActiveProvider(api, [], known);
         r.notes.forEach((n) => trace(`  \u63A2\u6D4B: ${n}`));
+        if (r.providerID === void 0) {
+          trace(`\u63A2\u6D4B\u672A\u547D\u4E2D\uFF0C\u6CBF\u7528\u4E0A\u6B21\u7ED3\u679C ${detectedProviderID ?? "(\u65E0\uFF0C\u4ECD\u663E\u793A\u9ED8\u8BA4)"}`);
+          return;
+        }
         if (r.providerID !== detectedProviderID) {
-          trace(`\u6D3B\u8DC3 provider: ${detectedProviderID ?? "(\u65E0)"} \u2192 ${r.providerID ?? "(\u4ECD\u672A\u63A2\u5230)"}`);
+          trace(`\u6D3B\u8DC3 provider: ${detectedProviderID ?? "(\u65E0)"} \u2192 ${r.providerID}`);
           detectedProviderID = r.providerID;
         }
       } catch (e) {
@@ -1626,6 +1713,7 @@ var tui = async (api, options) => {
         }
       })();
     }, 3e3);
+    void dumpApiSurface(api).then((lines) => lines.forEach((l) => trace(`API ${l}`))).catch((e) => trace(`dumpApiSurface \u629B\u5F02\u5E38: ${e instanceof Error ? e.message : String(e)}`));
     const dispose = () => {
       clearInterval(timer);
       clearInterval(watchTimer);
