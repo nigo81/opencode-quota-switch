@@ -93,3 +93,5 @@ export const BAR_GAP = 1
 export const PCT_WIDTH = 4
 /** 折叠三角 + 空格 */
 export const HEADER_PREFIX = 2
+/** 无限量窗口的标记（如 MiniMax 未购周包时的周窗口），单列宽 */
+export const UNLIMITED_GLYPH = "∞"

@@ -5,6 +5,8 @@
 export type QuotaWindow = {
   /** 窗口名："5h" / "周" / "MCP" / "额度" */
   label: string
+  /** 该窗口无限量（如 MiniMax 未购周包时周窗口恒为 status=3）。面板渲染为 ∞，不画条、无重置倒计时 */
+  unlimited?: boolean
   /** 已用百分比 0-100。undefined 表示该窗口无百分比语义（不画进度条） */
   usedPct?: number
   used?: number

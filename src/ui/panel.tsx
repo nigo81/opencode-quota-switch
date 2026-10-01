@@ -40,6 +40,7 @@ import {
   PCT_WIDTH,
   progressBar,
   truncateVisual,
+  UNLIMITED_GLYPH,
   visualWidth,
 } from "./widgets.js"
 
@@ -214,6 +215,9 @@ export function QuotaPanel(props: QuotaPanelProps): JSX.Element {
 
   const QuotaBlock = (p: { win: QuotaWindow }): JSX.Element => {
     const win = () => p.win
+    // 无限量窗口（如未购周包时的周窗口）：没有百分比语义，只有 ∞。
+    // resetLabel 天然为空，所以下面的重置行会自动整行跳过，无需额外判断。
+    const isUnlimited = (): boolean => win().unlimited === true
     const hasPct = (): boolean => win().usedPct !== undefined
     const pct = (): number => win().usedPct ?? 0
 
@@ -257,6 +261,12 @@ export function QuotaPanel(props: QuotaPanelProps): JSX.Element {
           <span style={{ fg: pal().accent }}>{labelTight()}</span>
         </Show>
       </text>,
+      // 无限量窗口：只画一个 ∞，不画条、不画百分比（hasPct 为 false 时下面的条形行自动跳过）
+      <Show when={isUnlimited()}>
+        <text>
+          <span style={{ fg: pal().info }}>{" " + UNLIMITED_GLYPH}</span>
+        </text>
+      </Show>,
       // 已知 bug 修复 #3：没有百分比语义就整行不画 —— 既不画一条假的 0% 空条，
       // 也不把整个窗口藏起来。标签行右边的 used/limit 照常显示。
       <Show when={hasPct()}>

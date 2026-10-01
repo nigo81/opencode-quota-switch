@@ -5,8 +5,9 @@
 //
 // 1. *_usage_count 在本接口返回的是「剩余」不是「已用」（旧的 coding_plan/remains 端点才是已用）。
 //    直接把它当 used 会得到完全颠倒的数字。本解析器只信 *_remaining_percent，usedPct = 100 - remaining。
-// 2. *_status === 3 表示「该窗口不适用于你当前的套餐层级」（实测 weekly_status:3 且 remaining=100%，
-//    属于典型的"没买周包"）。必须整行省略，否则会渲染出一条恒 0% 的假周窗口。
+// 2. *_status === 3 表示「该窗口对你的套餐不设限」（实测本账号 weekly_status:3 且 remaining=100%，
+//    用户确认未购周包）。此时该窗口是无限量，不能当 0% 画条，也不能整行丢掉让人以为没这项额度，
+//    故产出 unlimited 标记，由面板渲染为 ∞。
 // 3. 老套餐上 *_total_count 恒为 0，不能据此反推 used/limit（0 既可能是"无限量"也可能是"没数据"）。
 //    因此本解析器一律不产出 used/limit，面板退化为纯百分比行——这与 GLM 缺 percentage 时的
 //    TOKENS_LIMIT 兜底形态一致，UI 契约已覆盖（见 types.ts 的 QuotaWindow.usedPct 可选）。
@@ -34,11 +35,13 @@ function pickEntry(entries: Entry[]): Entry | undefined {
 /**
  * 构造单个额度窗口。prefix 决定读哪组 current_<prefix>_* 字段（interval / weekly），
  * 避免两个窗口复制两份字段名——字段名拼错是本接口最容易踩的坑。
- * 返回 undefined 表示该窗口不适用于当前套餐（status=3），调用方直接丢弃。
+ * status=3 表示该窗口不设限，产出 unlimited 窗口（渲染为 ∞），不是丢弃。
  */
-function minmaxWindow(entry: Entry, prefix: "interval" | "weekly", label: string): QuotaWindow | undefined {
-  // 陷阱 2：status=3 = 该窗口不适用于你的套餐层级，整行省略
-  if (toNum(entry[`current_${prefix}_status`]) === 3) return undefined
+function minmaxWindow(entry: Entry, prefix: "interval" | "weekly", label: string): QuotaWindow {
+  // 陷阱 2：status=3 = 该窗口无限量。标记出来，别画成 0% 条，也别整行丢掉
+  if (toNum(entry[`current_${prefix}_status`]) === 3) {
+    return { label, unlimited: true }
+  }
   const remaining = toNum(entry[`current_${prefix}_remaining_percent`])
   // 陷阱 1：只用 remaining_percent（无歧义），*_usage_count 是「剩余」不是「已用」，绝不能当 used
   const usedPct = remaining == null ? undefined : Math.max(0, Math.min(100, 100 - remaining))
@@ -73,10 +76,7 @@ export function parseMinimaxQuota(json: unknown): ProviderQuota {
   const entries = Array.isArray(raw) ? raw.map(asRecord).filter((e): e is Entry => e != null) : []
   const entry = pickEntry(entries)
   if (!entry) throw new Error("响应中无可用额度条目（model_remains 为空或 model_name 不可识别）")
-  const windows = [
-    minmaxWindow(entry, "interval", "5h"),
-    minmaxWindow(entry, "weekly", "周"),
-  ].filter((w): w is QuotaWindow => w != null)
-  if (!windows.length) throw new Error("额度条目的 5h/周窗口均为 status=3，不适用于当前套餐")
+  // 两个窗口恒有结果（不限量时产出 unlimited 窗口），无需再判空
+  const windows = [minmaxWindow(entry, "interval", "5h"), minmaxWindow(entry, "weekly", "周")]
   return { level: minmaxLevel(entry), windows: sortByDisplayOrder(windows), extras: [] }
 }
