@@ -1,7 +1,7 @@
 {
   "name": "opencode-quota-switch",
   "version": "0.1.0",
-  "description": "OpenCode TUI plugin — sidebar quota panel that follows the active provider (GLM / MiniMax / Kimi / DeepSeek)",
+  "description": "OpenCode TUI plugin — sidebar quota panel that follows the active provider (GLM / MiniMax / Kimi / DeepSeek / OpenCode Go)",
   "type": "module",
   "main": "dist/tui.js",
   "exports": {
