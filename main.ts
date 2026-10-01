@@ -278,4 +278,12 @@ const tui: TuiPlugin = async (api, options) => {
   })
 }
 
-export default { id: "quota-switch", tui }
+/**
+ * 双格式导出，缺一不可：
+ * - `tui`   → V1 宿主读这个字段
+ * - `setup` → V2 宿主读这个字段
+ * 只导出 `tui` 时，模块顶层代码会执行（看起来像加载成功），但入口函数永远
+ * 不会被调用，插件静默无任何表现——实测踩过：trace 只写出一行「模块加载」。
+ * 两个字段指向同一个函数体，避免两代行为分叉。
+ */
+export default { id: "quota-switch", tui, setup: tui }

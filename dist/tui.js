@@ -1402,7 +1402,7 @@ var tui = async (api, options) => {
     offs.forEach((off) => off());
   });
 };
-var main_default = { id: "quota-switch", tui };
+var main_default = { id: "quota-switch", tui, setup: tui };
 export {
   main_default as default
 };
