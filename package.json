@@ -32,7 +32,6 @@
   "engines": {
     "opencode": ">=1.17.0"
   },
-  "comment:dependencies": "CRITICAL — 两层约束，缺一不可：\n(1) dependencies 必须为空。solid-js / @opentui/solid / @opentui/core 全部 external，由宿主提供单实例。自带一份会出现两个渲染库实例，Solid 信号桥接不到宿主渲染循环，UI 冻结在首帧。\n(2) 也不要写 peerDependencies。宿主会按 peer 依赖实际安装并带上自己的版本树，与宿主侧那份冲突。\n运行时依赖必须保持 external 的实现方式见 build.mjs。",
   "dependencies": {},
   "devDependencies": {
     "@opencode-ai/plugin": "1.15.10",
