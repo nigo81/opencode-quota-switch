@@ -7,8 +7,10 @@
 import { createSignal } from "solid-js"
 import { createComponent } from "@opentui/solid"
 import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { detectActiveProvider, dumpApiSurface } from "./src/active-provider.js"
+import { detectActiveProvider } from "./src/active-provider.js"
 import { authFileProviders, authFileTrace } from "./src/authfile.js"
 import { availableAdapters, adapterForProviderId, fetchQuota } from "./src/providers/index.js"
 import { QuotaPanel } from "./src/ui/index.js"
@@ -20,18 +22,72 @@ const PLUGIN_VERSION = "0.1.0"
 /**
  * 排障 trace：宿主加载 TUI 插件时，槽位注册与渲染这两阶段不写任何日志，
  * 面板不显示时无法从 opencode.log 区分「没加载 / 没注册 / 没渲染」。
- * 这里同步追加到文件（appendFileSync 不会被进程退出吞掉）。
- * 排障完成后可整段删除。
+ * 这里同步追加到文件（同步写不会被进程退出吞掉）。
+ *
+ * ⚠️ 默认完全静默，要开必须自己 export 环境变量（任意非空值即开）：
+ *     OPENCODE_QUOTA_SWITCH_TRACE=1 opencode
+ * 之前是无条件写 `/tmp/opencode-quota-switch.log`，这个仓是 **公开插件**，
+ * 任意用户装上就往 /tmp 落一个 0644 文件——同机别的用户能直接读到，
+ * 里面还有 `~/.local/share/opencode/auth.json` 这种带用户名的绝对路径。
+ * 而且 watchTimer 3s 一轮、约 10KB/分钟，长挂一天能涨到十几 MB。
+ * 三处一起收紧：默认不写 → 落 `~/.local/state/` 且 0600 → 超 512KB 清空重写。
  */
-const TRACE_FILE = "/tmp/opencode-quota-switch.log"
+const TRACE_ENABLED =
+  process.env.OPENCODE_QUOTA_SWITCH_TRACE !== undefined &&
+  process.env.OPENCODE_QUOTA_SWITCH_TRACE !== ""
+const TRACE_MAX_BYTES = 512 * 1024
+const TRACE_FILE = path.join(os.homedir(), ".local", "state", "opencode", "quota-switch.log")
+
+/**
+ * trace 里绝不出现 home 绝对路径（含用户名）。这条是兜底：具体业务日志自己
+ * 也要按需脱敏（见 authFileTraceSafe），但万一漏了，home 前缀至少会被压成 ~。
+ */
+function redactHome(s: string): string {
+  const home = os.homedir()
+  return home ? s.split(home).join("~") : s
+}
+
 function trace(msg: string): void {
+  if (!TRACE_ENABLED) return
   try {
-    fs.appendFileSync(TRACE_FILE, `[${new Date().toISOString()}] ${msg}\n`)
+    fs.mkdirSync(path.dirname(TRACE_FILE), { recursive: true })
+    // open 的 mode 只在**创建**时生效，碰上历史遗留的宽权限文件不会自动收紧，
+    // 所以写入前显式 chmod 一次 0600（trace 默认关闭，这点开销无所谓）
+    try {
+      fs.chmodSync(TRACE_FILE, 0o600)
+    } catch {
+      /* 文件还不存在：下面 open 时用 0600 建出来 */
+    }
+    const fd = fs.openSync(TRACE_FILE, "a", 0o600)
+    try {
+      // 长挂进程不让日志无限膨胀：超阈值就清空重写（O_APPEND 没法原地截断）
+      if (fs.fstatSync(fd).size > TRACE_MAX_BYTES) {
+        fs.ftruncateSync(fd, 0)
+        fs.writeSync(fd, `[${new Date().toISOString()}] (超过 ${TRACE_MAX_BYTES}B，日志已清空)\n`)
+        return
+      }
+      fs.writeSync(fd, `[${new Date().toISOString()}] ${redactHome(msg)}\n`)
+    } finally {
+      fs.closeSync(fd)
+    }
   } catch {
     /* trace 失败不影响插件功能 */
   }
 }
 trace(`=== 模块加载 (pid=${process.pid}) ===`)
+
+/**
+ * authFileTrace() 的首段是 auth.json 的**绝对路径**（含用户名，见
+ * src/authfile.ts 的 readAuthFile → from）。公开插件的 trace 随时可能被贴进
+ * issue，所以这里只留 basename：变成 `auth.json → [provider 列表]`。
+ * 不去改 authfile.ts：那边本来是给本机人看的原始信息，脱敏放在调用点。
+ */
+function authFileTraceSafe(): string {
+  const raw = authFileTrace()
+  const i = raw.indexOf("→")
+  if (i < 0) return path.basename(raw)
+  return `${path.basename(raw.slice(0, i).trim())} ${raw.slice(i)}`
+}
 
 type SwitchOptions = {
   /** 白名单，空/缺省 = 全部启用。值是 adapter id 或展示名 */
@@ -237,7 +293,6 @@ const tui: TuiPlugin = async (api, options) => {
 
   const [snapshot, setSnapshot] = createSignal<QuotaSnapshot | null>(null)
   const [title, setTitle] = createSignal(opts.title ?? "套餐用量")
-  const [refreshTick, setRefreshTick] = createSignal(0)
 
   // ---------------------------------------------------------------- 活跃 provider
   // v2.0.21 没有 api.state，槽位 render 回调也不传 session_id（trace 实测
@@ -294,52 +349,107 @@ const tui: TuiPlugin = async (api, options) => {
   let lastFetch = 0
   let inFlight = false
   let retryCount = 0
+  /**
+   * 请求序号：切 provider 时，旧 provider 的慢响应可能后到，把新结果盖掉——
+   * 用户看到的是「标题已经切到新 provider，内容还是上一家的额度」。
+   * 做法是**在 await 之前领号**（而不是之后 ++），回来时号不是最新的就丢弃。
+   */
+  let fetchSeq = 0
+  /** dispose 之后不再重排重试、不再触发新的一轮 load */
+  let stopped = false
+  let retryTimer: ReturnType<typeof setTimeout> | undefined
+
   /** 探测活跃 provider 是异步的，首次可能扑空，阶梯重试几次 */
   function scheduleRetry(): void {
+    if (stopped) return
     if (retryCount >= 6) return
     const delay = Math.min(4000, 300 * 2 ** retryCount)
     retryCount += 1
-    setTimeout(() => void load(true), delay)
+    // 句柄必须留着：dispose 要能 clearTimeout，否则插件卸载后这一轮还会
+    // 跑起来 load(true) 并再排下一轮，dispose 之后仍然在打接口
+    if (retryTimer !== undefined) clearTimeout(retryTimer)
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined
+      if (stopped) return
+      void load(true)
+    }, delay)
   }
-  async function load(force: boolean): Promise<void> {
+
+  /**
+   * @returns true = 本轮真的跑了（或主动渲染了探测中状态）；false = 被跳过。
+   *         调用方（watchTimer）靠这个返回值判断要不要补一次，否则「已有请求
+   *         在飞 → 直接丢弃」会把 provider 切换整个吞掉：标题已经切成新
+   *         provider，内容还停在上一家，正是 #2 要消灭的那个现象。
+   * @param probed 调用方**已经探好**的活跃 provider（watchTimer 每 3s 探过一次）。
+   *        传了就跳过 load 内部的 refreshActiveProvider()：切 provider 那一瞬间
+   *        session.list() 会被打两遍，两次结果还可能打架，白花一次往返。
+   *        注意值本身不覆盖 detectedProviderID —— refreshActiveProvider() 已经
+   *        写进去了，这里只是复用，不重复写。
+   */
+  async function load(force: boolean, probed?: { providerID: string | undefined }): Promise<boolean> {
     const now = Date.now()
-    if (!force && now - lastFetch < intervalMs - 1000) return
-    if (inFlight) return
-    // 每轮取数前先重新探测一次活跃 provider：用户切模型/切会话后能自动跟上
-    await refreshActiveProvider()
-    // 还没探测到过活跃 provider：什么都不取，只显示「探测中…」。
-    // 否则 activeAdapter() 会回落到候选列表首个（GLM），把 GLM 的数据
-    // 冒充成当前 provider 显示——启动头几秒会闪一次 GLM。
-    if (!hasDetected) {
-      trace("load：活跃 provider 尚未探测到，显示探测中")
-      setSnapshot({ provider: "", ok: false, error: "", detecting: true, fetchedAt: now })
-      scheduleRetry()
-      return
+    if (!force && now - lastFetch < intervalMs - 1000) return false
+    if (inFlight) {
+      trace("load：已有请求在飞，本次跳过")
+      return false
     }
-    const adapter = activeAdapter()
-    if (!adapter) {
-      trace(`load：未找到可用 adapter（第 ${retryCount} 次，将重试）`)
-      setSnapshot({ provider: "—", ok: false, error: "未找到可用的套餐 provider", fetchedAt: now })
-      scheduleRetry()
-      return
-    }
-    retryCount = 0
+    // ⚠️ 必须在第一个 await 之前置位。原来它夹在 `await refreshActiveProvider()`
+    // 后面，守卫窗口正好落在最需要的 await 期间：watchTimer 判定 provider 变化
+    // → load(true) 的探测还没返回，session.idle 触发的 load(true) 就一起冲进来了。
     inFlight = true
-    lastFetch = now
     try {
-      const quota = await fetchQuota(adapter, getProviders())
-      trace(`load 成功 provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`)
-      setTitle(panelTitle())
-      setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now })
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      trace(`load 失败 provider=${adapter.label} err=${msg}`)
-      setSnapshot({
-        provider: adapter.label,
-        ok: false,
-        error: msg,
-        fetchedAt: now,
-      })
+      if (probed) {
+        trace(`load：复用调用方已探结果 provider=${probed.providerID ?? "(未命中)"}`)
+      } else {
+        // 每轮取数前先重新探测一次活跃 provider：用户切模型/切会话后能自动跟上
+        await refreshActiveProvider()
+      }
+      // 还没探测到过活跃 provider：什么都不取，只显示「探测中…」。
+      // 否则 activeAdapter() 会回落到候选列表首个（GLM），把 GLM 的数据
+      // 冒充成当前 provider 显示——启动头几秒会闪一次 GLM。
+      if (!hasDetected) {
+        trace("load：活跃 provider 尚未探测到，显示探测中")
+        setSnapshot({ provider: "", ok: false, error: "", detecting: true, fetchedAt: now })
+        scheduleRetry()
+        return true
+      }
+      const adapter = activeAdapter()
+      if (!adapter) {
+        trace(`load：未找到可用 adapter（第 ${retryCount} 次，将重试）`)
+        setSnapshot({ provider: "—", ok: false, error: "未找到可用的套餐 provider", fetchedAt: now })
+        scheduleRetry()
+        return true
+      }
+      retryCount = 0
+      lastFetch = now
+      const mySeq = ++fetchSeq
+      try {
+        const quota = await fetchQuota(adapter, getProviders())
+        // 过期响应直接丢：晚到的旧 provider 数据会盖掉新的，用户看到串台。
+        // 对调用方来说这算「跑过了」——已经有更新的请求在途，不用补。
+        if (mySeq !== fetchSeq) {
+          trace(`丢弃过期响应 provider=${adapter.label} seq=${mySeq}/${fetchSeq}`)
+          return true
+        }
+        trace(`load 成功 provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`)
+        setTitle(panelTitle())
+        setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now })
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        // 失败路径同样要过序号：旧 provider 的报错不该盖掉新 provider 的成功结果
+        if (mySeq !== fetchSeq) {
+          trace(`丢弃过期失败 provider=${adapter.label} seq=${mySeq}/${fetchSeq} err=${msg}`)
+          return true
+        }
+        trace(`load 失败 provider=${adapter.label} err=${msg}`)
+        setSnapshot({
+          provider: adapter.label,
+          ok: false,
+          error: msg,
+          fetchedAt: now,
+        })
+      }
+      return true
     } finally {
       inFlight = false
     }
@@ -347,25 +457,42 @@ const tui: TuiPlugin = async (api, options) => {
 
   // 槽位 props 里的 session_id 决定「当前 provider」，由宿主在切换会话时重新调用
   let sessionID: string | undefined
+  /**
+   * 面板实例缓存。宿主每注册/重挂一次侧栏就可能再调一次 render，
+   * 而 render 里 `createComponent(QuotaPanel, …)` 每调一次就造一个**全新实例**：
+   * 每个实例自带 1s setInterval（panel.tsx 的 tickTimer）、kv 冷启轮询
+   * （restoreConfig 那条 10ms 轮询）和一整排 createEffect/createMemo，
+   * 宿主多调一次渲染这些就整体翻倍（panel.tsx 里「目标 r.notes≈60」就是按
+   * 单实例估的）。参考实现 opencode-glm-vistatus 也是显式
+   * `if (!card) card = new QuotaCard(...)`。
+   * props 里传的一直是 signal 函数本身（snapshot/title），所以缓存下来的
+   * 实例读到的仍然是最新值，缓存不影响数据刷新。
+   */
+  let panel: unknown
+  let renderCount = 0
   const render = (slotProps?: unknown): unknown => {
+    renderCount += 1
     const props = asRecord(slotProps)
     const next = typeof props?.session_id === "string" ? props.session_id : sessionID
+    // 每次 render 都打一行带计数的 trace：之前只在 session_id 变化时打，
+    // 宿主到底调了几次 render 从日志里根本看不出来，所以「多实例」一直没被发现。
+    // trace 现在默认关闭（要 export OPENCODE_QUOTA_SWITCH_TRACE），刷屏无所谓。
+    trace(`render #${renderCount} session=${next ?? "(none)"}${panel === undefined ? "（创建面板实例）" : "（复用实例）"}`)
     if (next !== sessionID) {
       sessionID = next
-      trace(`render 被调用 session=${next ?? "(none)"}`)
       setTitle(panelTitle())
       void load(true)
     }
     // 必须经 createComponent 在宿主的响应式 owner 内实例化。
     // 直接调用 QuotaPanel({...}) 不会建立 owner，组件不渲染（实测踩过）。
-    return createComponent(QuotaPanel, {
+    // ??= 保证只在第一次 render 时真正实例化。
+    return (panel ??= createComponent(QuotaPanel, {
       snapshot,
       title,
       theme: api.theme,
       kv: api.kv,
-      refreshSignal: refreshTick,
       version: PLUGIN_VERSION,
-    })
+    }))
   }
 
   const stopReady = whenRendererReady(api, () => {
@@ -379,16 +506,17 @@ const tui: TuiPlugin = async (api, options) => {
     void load(true)
   })
 
-  // /quota-refresh：bump 信号让面板立即重取，同时强制绕过 interval 节流
+  // /quota-refresh：直接强制绕过 interval 节流重取一次。
+  // 这里**不需要**再 bump 什么刷新信号：面板读的是 snapshot signal，setSnapshot
+  // 一改它自己就重算了。原来那条「信号 → panel 空转 effect」的链路已整条删除。
   const offRefresh = registerRefreshCommand(api, () => {
-    setRefreshTick(Date.now())
     void load(true)
   })
 
   // 消息更新 = 可能换 provider；空闲 = 一次问答结束，两个都要重新判定。
   // v2.0.21 实测没有 api.event，事件总线是 api.data.on（成员 on/listen/session/project/…）。
   trace(`准备注册，candidates=${candidates().map((c) => c.id).join(",") || "(无)"}`)
-  trace(`凭证来源 auth.json: ${authFileTrace()}`)
+  trace(`凭证来源 auth.json: ${authFileTraceSafe()}`)
   trace(`合并后 provider 条目: ${getProviders().map((p) => `${p.id}${p.baseURL ? "(有baseURL)" : ""}`).join(",") || "(无)"}`)
   const dataNS = asRecord(asRecord(api)?.data)
   const dataOn = dataNS?.on as ((e: string, cb: () => void) => unknown) | undefined
@@ -408,23 +536,28 @@ const tui: TuiPlugin = async (api, options) => {
 
   // 切 provider 的响应要快：每 3s 只探不取，只有探到变化时才重新取数。
   // 60s 的取数节流保持不变，所以这个轮询几乎不产生额外请求。
+  // 探到的结果直接透传给 load：否则 load 内部又会 refreshActiveProvider() 一遍，
+  // 切 provider 那一瞬间 session.list() 白打两次。
   const watchTimer = setInterval(() => {
     void (async () => {
+      if (stopped) return
       const before = detectedProviderID
       await refreshActiveProvider()
+      if (stopped) return
       if (detectedProviderID !== before) {
         setTitle(panelTitle())
-        void load(true)
+        // load 被跳过（慢请求在飞）的话这次切换就丢了，补一轮阶梯重试
+        if (!load(true, { providerID: detectedProviderID })) {
+          trace("watchTimer：本次 load 被跳过，排一轮重试")
+          scheduleRetry()
+        }
       }
     })()
   }, 3000)
 
-  // 一次性把 API 形状打进 trace，setup 阶段跑一次就够
-  void dumpApiSurface(api)
-    .then((lines) => lines.forEach((l) => trace(`API ${l}`)))
-    .catch((e) => trace(`dumpApiSurface 抛异常: ${e instanceof Error ? e.message : String(e)}`))
-
   const dispose = (): void => {
+    stopped = true
+    if (retryTimer !== undefined) clearTimeout(retryTimer)
     clearInterval(timer)
     clearInterval(watchTimer)
     stopReady()

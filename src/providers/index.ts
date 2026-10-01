@@ -1,8 +1,13 @@
 // Provider 层出口：adapter 注册表 + 凭证挑选 + 抓取编排。
 //
-// 设计约束：凭证只来自宿主 provider 列表（api.state.provider 逐字段收窄出的 ProviderLike），
-// 不读 auth.json、不落盘、不打日志。UI 层只认本文件导出的 ProviderAdapter / PROVIDERS /
-// fetchQuota / availableAdapters，不要直接 import 单个 adapter 模块。
+// 设计约束：凭证只来自宿主 provider 列表，不读本文件之外的旁路、不落盘、不打日志。
+// UI 层只认本文件导出的 ProviderAdapter / PROVIDERS / fetchQuota / availableAdapters，
+// 不要直接 import 单个 adapter 模块。
+//
+// 关于凭证来源：v2.0.21 宿主实测不暴露 api.state（成员只有 options/location/app/renderer/
+// client/data/attention/theme/themeMode/markdown/keymap/storage/ui），拿不到 provider 列表，
+// 所以本文件不再从 api.state.provider 逐字段收窄 ProviderLike——那条路是 v2.0.21 之前的写法，
+// 保留它只会让人以为宿主还有这个 API。凭证实际由 authfile.ts 从 auth.json 读出 ProviderLike[] 传入。
 
 import { pickProvider } from "../http.js"
 import type { ProviderLike, ProviderQuota } from "../types.js"
@@ -37,27 +42,6 @@ export const PROVIDERS: readonly ProviderAdapter[] = [
 
 function nonEmpty(s: string | undefined): boolean {
   return s != null && s.trim() !== ""
-}
-
-/** provider 对象逐字段运行时校验，不直接信任 SDK 类型形状 */
-type ProviderSource = { state: { provider: readonly unknown[] } }
-
-export function providerList(api: ProviderSource): ProviderLike[] {
-  return api.state.provider.map((p): ProviderLike => {
-    const rec = asRecordOf(p)
-    const options = rec?.options
-    const optionsRec = asRecordOf(options)
-    return {
-      id: typeof rec?.id === "string" ? rec.id : undefined,
-      name: typeof rec?.name === "string" ? rec.name : undefined,
-      baseURL: typeof optionsRec?.baseURL === "string" ? optionsRec.baseURL : undefined,
-      apiKey: typeof optionsRec?.apiKey === "string" ? optionsRec.apiKey : undefined,
-    }
-  })
-}
-
-function asRecordOf(v: unknown): Record<string, unknown> | undefined {
-  return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined
 }
 
 /**

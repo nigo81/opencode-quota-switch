@@ -58,10 +58,6 @@ export type QuotaPanelProps = {
   title: () => string
   theme: TuiTheme
   kv: TuiKV
-  /** 递增这个数字即可强制立刻拉一次数据 */
-  refreshSignal: () => number
-  /** 可选：refreshSignal 真正发生变化时的回调，供 main.ts 触发立即刷新 */
-  onRefresh?: () => void
   /** 可选：标题右侧的版本号，如 "1.5.0"，渲染成 `v1.5.0` */
   version?: string
 }
@@ -135,17 +131,6 @@ export function QuotaPanel(props: QuotaPanelProps): JSX.Element {
   onCleanup(() => {
     if (tickTimer !== undefined) clearInterval(tickTimer)
     if (kvPollTimer !== undefined) clearTimeout(kvPollTimer)
-  })
-
-  // refreshSignal 只在"真的被推进"时通知调用方，首次挂载不算。
-  // main.ts 目前的 /quota-refresh 命令自己调 load()，没传 onRefresh，
-  // 所以这个 effect 目前是空转的；留着是为了契约里 refreshSignal 有明确归属。
-  let seenRefreshSignal = props.refreshSignal()
-  createEffect(() => {
-    const tick = props.refreshSignal()
-    if (tick === seenRefreshSignal) return
-    seenRefreshSignal = tick
-    props.onRefresh?.()
   })
 
   // ---------------------------------------------------------------- 布局

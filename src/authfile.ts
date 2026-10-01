@@ -65,9 +65,13 @@ export function authFileProviders(): ProviderLike[] {
 }
 
 /** 供 trace 用：只回显候选文件名与 provider id 列表，绝不回显 key */
+/**
+ * 给人看的来源摘要。**只回显 basename**：本仓是公开插件，trace 随时可能被贴进
+ * issue，auth.json 的绝对路径带用户名（/Users/xxx/...），在源头就不该吐出来。
+ */
 export function authFileTrace(): string {
   const { list, from } = readAuthFile()
-  return `${from} → [${list.map((p) => p.id).join(",") || "(空)"}]`
+  return `${path.basename(from)} → [${list.map((p) => p.id).join(",") || "(空)"}]`
 }
 
 /** 测试用：清掉 TTL 缓存 */

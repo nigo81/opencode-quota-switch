@@ -15,12 +15,18 @@ function kimiWindowLabel(win: Record<string, unknown> | undefined): string {
   return `${dur}`
 }
 
-// Kimi 双拼写：used 直给，或 remaining 反推
+// Kimi 双拼写：used 直给，或 remaining 反推。
+//
+// 反推这条路必须 clamp 成 [0, limit]：本接口在周窗口重置前后会切换字段（满额时给 used，
+// 清零后给 remaining，实证 2026-09-14），而**切换期正是 remaining 可能越界的时刻**——
+// 厂商那边 remaining 偶尔比 limit 还大（重置后把上一周期的残留算进去了）。
+// 不 clamp 就是 limit - remaining 算出负数，面板 src/ui/panel.tsx 照实渲染成 "-20/100"。
+// 注意 pctOf 只 clamp 了百分比那一侧，used 本身这条线没人管，负数就是从这里漏下去的。
 function kimiUsed(detail: Record<string, unknown> | undefined, limit: number | undefined): number | undefined {
   const used = toNum(detail?.used)
   if (used != null) return used
   const remaining = toNum(detail?.remaining)
-  if (remaining != null && limit != null) return limit - remaining
+  if (remaining != null && limit != null) return Math.min(limit, Math.max(0, limit - remaining))
   return undefined
 }
 

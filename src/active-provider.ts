@@ -159,59 +159,6 @@ export type ProbeResult = {
  * 依次尝试各条判定路径。全程只读，不写宿主状态。
  * @param preferIDs 上层已知的候选（来自 render props 等），命中就直接用
  */
-/**
- * 一次性把宿主 API 的形状全打出来。只在 setup 后跑一次，
- * 免得每 3s 轮询刷屏。只打 key 名单，不回显值。
- */
-export async function dumpApiSurface(api: unknown): Promise<string[]> {
-  const out: string[] = []
-  const a = rec(api) ?? {}
-  const shape = (label: string, v: unknown) => out.push(`  ${label} = ${keyList(v)}`)
-
-  shape("api.storage.store", (rec(a.storage) as Rec | undefined)?.store)
-  shape("api.storage.memory", (rec(a.storage) as Rec | undefined)?.memory)
-  shape("api.data.session", (rec(a.data) as Rec | undefined)?.session)
-  shape("api.data.project", (rec(a.data) as Rec | undefined)?.project)
-  shape("api.location", a.location)
-  shape("api.attention", a.attention)
-  shape("api.app", a.app)
-  shape("api.renderer", a.renderer)
-  shape("api.ui.panel", (rec(a.ui) as Rec | undefined)?.panel)
-  shape("api.ui.tabs", (rec(a.ui) as Rec | undefined)?.tabs)
-
-  // 会话列表项到底有哪些字段
-  const client = rec(a.client) ?? {}
-  const listFn = (rec(client.session) as Rec | undefined)?.list as (() => Promise<unknown>) | undefined
-  if (typeof listFn === "function") {
-    try {
-      const list = await listFn.call(rec(client.session))
-      const arr = Array.isArray(list) ? list : ((rec(list)?.data as unknown[] | undefined) ?? [])
-      out.push(`  session.list()[0] keys = ${keyList(arr[0])}`)
-      out.push(`  session.list()[0].time = ${JSON.stringify((rec(arr[0]) as Rec | undefined)?.time ?? null)}`)
-      if (arr.length > 1) out.push(`  session.list()[1] keys = ${keyList(arr[1])}`)
-    } catch (e) {
-      out.push(`  session.list() 抛异常: ${e instanceof Error ? e.message.split("\n")[0] : "?"}`)
-    }
-  }
-
-  // storage 里如果存着当前会话/模型，直接读出来（只读，不写）
-  const store = ((rec(a.storage) as Rec | undefined)?.store ?? undefined) as Rec | undefined
-  for (const key of Object.keys(store ?? {})) {
-    const fn = store![key]
-    if (typeof fn !== "function") {
-      out.push(`  storage.store.${key} = ${typeof fn}`)
-      continue
-    }
-    try {
-      const v = await (fn as () => unknown).call(store)
-      out.push(`  storage.store.${key}() = ${typeof v === "string" ? v : keyList(v)}`)
-    } catch (e) {
-      out.push(`  storage.store.${key}() 抛异常: ${e instanceof Error ? e.message.split("\n")[0] : "?"}`)
-    }
-  }
-  return out
-}
-
 export async function detectActiveProvider(
   api: unknown,
   preferIDs: (string | undefined)[] = [],

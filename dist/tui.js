@@ -2,6 +2,8 @@
 import { createSignal as createSignal2 } from "solid-js";
 import { createComponent } from "@opentui/solid";
 import fs2 from "node:fs";
+import os2 from "node:os";
+import path2 from "node:path";
 
 // src/active-provider.ts
 function rec(v) {
@@ -98,49 +100,6 @@ function providerIDFromMessages(payload, known) {
     }
   }
   return void 0;
-}
-async function dumpApiSurface(api) {
-  const out = [];
-  const a = rec(api) ?? {};
-  const shape = (label, v) => out.push(`  ${label} = ${keyList(v)}`);
-  shape("api.storage.store", rec(a.storage)?.store);
-  shape("api.storage.memory", rec(a.storage)?.memory);
-  shape("api.data.session", rec(a.data)?.session);
-  shape("api.data.project", rec(a.data)?.project);
-  shape("api.location", a.location);
-  shape("api.attention", a.attention);
-  shape("api.app", a.app);
-  shape("api.renderer", a.renderer);
-  shape("api.ui.panel", rec(a.ui)?.panel);
-  shape("api.ui.tabs", rec(a.ui)?.tabs);
-  const client = rec(a.client) ?? {};
-  const listFn = rec(client.session)?.list;
-  if (typeof listFn === "function") {
-    try {
-      const list = await listFn.call(rec(client.session));
-      const arr = Array.isArray(list) ? list : rec(list)?.data ?? [];
-      out.push(`  session.list()[0] keys = ${keyList(arr[0])}`);
-      out.push(`  session.list()[0].time = ${JSON.stringify(rec(arr[0])?.time ?? null)}`);
-      if (arr.length > 1) out.push(`  session.list()[1] keys = ${keyList(arr[1])}`);
-    } catch (e) {
-      out.push(`  session.list() \u629B\u5F02\u5E38: ${e instanceof Error ? e.message.split("\n")[0] : "?"}`);
-    }
-  }
-  const store = rec(a.storage)?.store ?? void 0;
-  for (const key of Object.keys(store ?? {})) {
-    const fn = store[key];
-    if (typeof fn !== "function") {
-      out.push(`  storage.store.${key} = ${typeof fn}`);
-      continue;
-    }
-    try {
-      const v = await fn.call(store);
-      out.push(`  storage.store.${key}() = ${typeof v === "string" ? v : keyList(v)}`);
-    } catch (e) {
-      out.push(`  storage.store.${key}() \u629B\u5F02\u5E38: ${e instanceof Error ? e.message.split("\n")[0] : "?"}`);
-    }
-  }
-  return out;
 }
 async function detectActiveProvider(api, preferIDs = [], known = []) {
   const notes = [];
@@ -272,7 +231,7 @@ function authFileProviders() {
 }
 function authFileTrace() {
   const { list, from } = readAuthFile();
-  return `${from} \u2192 [${list.map((p) => p.id).join(",") || "(\u7A7A)"}]`;
+  return `${path.basename(from)} \u2192 [${list.map((p) => p.id).join(",") || "(\u7A7A)"}]`;
 }
 
 // src/http.ts
@@ -450,9 +409,10 @@ var deepseekAdapter = {
 function glmWindowRow(l, label) {
   const total = toNum(l?.usage);
   const used = toNum(l?.currentValue);
+  const rawPct = toNum(l?.percentage);
   return {
     label,
-    usedPct: toNum(l?.percentage) ?? pctOf(used, total),
+    usedPct: rawPct == null ? pctOf(used, total) : Math.max(0, Math.min(100, rawPct)),
     used,
     limit: total,
     resetLabel: formatReset(l?.nextResetTime)
@@ -467,22 +427,38 @@ function glmCreditLabel(l, fallback) {
   const unit = toNum(l?.unit);
   const number = toNum(l?.number);
   if (unit === 3 && number === 5) return "5h";
-  if (unit != null && number != null) return "\u5468";
+  if (unit === 6 && number === 1) return "\u5468";
+  if (number != null) return `\u7A97\u53E3${number}`;
   return fallback;
+}
+function dedupeLabels(windows) {
+  const seen = /* @__PURE__ */ new Set();
+  const suffixed = (base, n) => /\d$/.test(base) ? `${base}#${n}` : `${base}${n}`;
+  for (const w of windows) {
+    if (!seen.has(w.label)) {
+      seen.add(w.label);
+      continue;
+    }
+    let n = 2;
+    while (seen.has(suffixed(w.label, n))) n++;
+    w.label = suffixed(w.label, n);
+    seen.add(w.label);
+  }
+  return windows;
 }
 function glmWindows(data) {
   const rawLimits = limitsOf(data);
   const windows = [];
   const tokenLike = rawLimits.filter((l) => l?.type === "TOKENS_LIMIT" || l?.type === "CREDIT_LIMIT");
   const sorted = [...tokenLike].sort(
-    (a, b) => (toNum(a?.nextResetTime) ?? Number.MAX_SAFE_INTEGER) - (toNum(b?.nextResetTime) ?? Number.MAX_SAFE_INTEGER)
+    (a, b) => (timeToMs(a?.nextResetTime) ?? Number.MAX_SAFE_INTEGER) - (timeToMs(b?.nextResetTime) ?? Number.MAX_SAFE_INTEGER)
   );
   sorted.forEach((l, i) => {
     windows.push(glmWindowRow(l, glmCreditLabel(l, glmLegacyLabel(sorted.length, i))));
   });
   const mcp = rawLimits.find((l) => l?.type === "TIME_LIMIT");
   if (mcp) windows.push(glmWindowRow(mcp, "MCP"));
-  return sortByDisplayOrder(windows);
+  return dedupeLabels(sortByDisplayOrder(windows));
 }
 function parseGlmQuota(json) {
   const root = asRecord(json);
@@ -532,7 +508,7 @@ function kimiUsed(detail, limit) {
   const used = toNum(detail?.used);
   if (used != null) return used;
   const remaining = toNum(detail?.remaining);
-  if (remaining != null && limit != null) return limit - remaining;
+  if (remaining != null && limit != null) return Math.min(limit, Math.max(0, limit - remaining));
   return void 0;
 }
 function kimiWindows(root) {
@@ -1102,13 +1078,6 @@ function QuotaPanel(props) {
     if (tickTimer !== void 0) clearInterval(tickTimer);
     if (kvPollTimer !== void 0) clearTimeout(kvPollTimer);
   });
-  let seenRefreshSignal = props.refreshSignal();
-  createEffect(() => {
-    const tick = props.refreshSignal();
-    if (tick === seenRefreshSignal) return;
-    seenRefreshSignal = tick;
-    props.onRefresh?.();
-  });
   const gutter = createMemo(() => borderVisible() ? 6 : 0);
   const gauge = createMemo(() => panelWidth() - gutter());
   const sep = createMemo(() => SEP.repeat(Math.max(1, gauge())));
@@ -1534,15 +1503,44 @@ function QuotaPanel(props) {
 
 // main.ts
 var PLUGIN_VERSION = "0.1.0";
-var TRACE_FILE = "/tmp/opencode-quota-switch.log";
+var TRACE_ENABLED = process.env.OPENCODE_QUOTA_SWITCH_TRACE !== void 0 && process.env.OPENCODE_QUOTA_SWITCH_TRACE !== "";
+var TRACE_MAX_BYTES = 512 * 1024;
+var TRACE_FILE = path2.join(os2.homedir(), ".local", "state", "opencode", "quota-switch.log");
+function redactHome(s) {
+  const home = os2.homedir();
+  return home ? s.split(home).join("~") : s;
+}
 function trace(msg) {
+  if (!TRACE_ENABLED) return;
   try {
-    fs2.appendFileSync(TRACE_FILE, `[${(/* @__PURE__ */ new Date()).toISOString()}] ${msg}
+    fs2.mkdirSync(path2.dirname(TRACE_FILE), { recursive: true });
+    try {
+      fs2.chmodSync(TRACE_FILE, 384);
+    } catch {
+    }
+    const fd = fs2.openSync(TRACE_FILE, "a", 384);
+    try {
+      if (fs2.fstatSync(fd).size > TRACE_MAX_BYTES) {
+        fs2.ftruncateSync(fd, 0);
+        fs2.writeSync(fd, `[${(/* @__PURE__ */ new Date()).toISOString()}] (\u8D85\u8FC7 ${TRACE_MAX_BYTES}B\uFF0C\u65E5\u5FD7\u5DF2\u6E05\u7A7A)
 `);
+        return;
+      }
+      fs2.writeSync(fd, `[${(/* @__PURE__ */ new Date()).toISOString()}] ${redactHome(msg)}
+`);
+    } finally {
+      fs2.closeSync(fd);
+    }
   } catch {
   }
 }
 trace(`=== \u6A21\u5757\u52A0\u8F7D (pid=${process.pid}) ===`);
+function authFileTraceSafe() {
+  const raw = authFileTrace();
+  const i = raw.indexOf("\u2192");
+  if (i < 0) return path2.basename(raw);
+  return `${path2.basename(raw.slice(0, i).trim())} ${raw.slice(i)}`;
+}
 function readOptions(raw) {
   const num = (v) => typeof v === "number" && Number.isFinite(v) ? v : void 0;
   const str = (v) => typeof v === "string" ? v : void 0;
@@ -1684,10 +1682,16 @@ var tui = async (api, options) => {
       if (!hasDetected) return "\u5957\u9910 Quota";
       return `${activeAdapter2()?.label ?? "\u5957\u9910"} Quota`;
     }, scheduleRetry2 = function() {
+      if (stopped) return;
       if (retryCount >= 6) return;
       const delay = Math.min(4e3, 300 * 2 ** retryCount);
       retryCount += 1;
-      setTimeout(() => void load(true), delay);
+      if (retryTimer !== void 0) clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => {
+        retryTimer = void 0;
+        if (stopped) return;
+        void load(true);
+      }, delay);
     };
     var activeAdapter = activeAdapter2, panelTitle = panelTitle2, scheduleRetry = scheduleRetry2;
     trace(`setup \u5F00\u59CB renderer=${String(api.renderer?.isRunning)}`);
@@ -1710,7 +1714,6 @@ var tui = async (api, options) => {
     );
     const [snapshot, setSnapshot] = createSignal2(null);
     const [title, setTitle] = createSignal2(opts.title ?? "\u5957\u9910\u7528\u91CF");
-    const [refreshTick, setRefreshTick] = createSignal2(0);
     let detectedProviderID;
     let hasDetected = false;
     let probeInFlight = false;
@@ -1739,61 +1742,85 @@ var tui = async (api, options) => {
     let lastFetch = 0;
     let inFlight = false;
     let retryCount = 0;
-    async function load(force) {
+    let fetchSeq = 0;
+    let stopped = false;
+    let retryTimer;
+    async function load(force, probed) {
       const now = Date.now();
-      if (!force && now - lastFetch < intervalMs - 1e3) return;
-      if (inFlight) return;
-      await refreshActiveProvider();
-      if (!hasDetected) {
-        trace("load\uFF1A\u6D3B\u8DC3 provider \u5C1A\u672A\u63A2\u6D4B\u5230\uFF0C\u663E\u793A\u63A2\u6D4B\u4E2D");
-        setSnapshot({ provider: "", ok: false, error: "", detecting: true, fetchedAt: now });
-        scheduleRetry2();
-        return;
+      if (!force && now - lastFetch < intervalMs - 1e3) return false;
+      if (inFlight) {
+        trace("load\uFF1A\u5DF2\u6709\u8BF7\u6C42\u5728\u98DE\uFF0C\u672C\u6B21\u8DF3\u8FC7");
+        return false;
       }
-      const adapter = activeAdapter2();
-      if (!adapter) {
-        trace(`load\uFF1A\u672A\u627E\u5230\u53EF\u7528 adapter\uFF08\u7B2C ${retryCount} \u6B21\uFF0C\u5C06\u91CD\u8BD5\uFF09`);
-        setSnapshot({ provider: "\u2014", ok: false, error: "\u672A\u627E\u5230\u53EF\u7528\u7684\u5957\u9910 provider", fetchedAt: now });
-        scheduleRetry2();
-        return;
-      }
-      retryCount = 0;
       inFlight = true;
-      lastFetch = now;
       try {
-        const quota = await fetchQuota(adapter, getProviders());
-        trace(`load \u6210\u529F provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`);
-        setTitle(panelTitle2());
-        setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        trace(`load \u5931\u8D25 provider=${adapter.label} err=${msg}`);
-        setSnapshot({
-          provider: adapter.label,
-          ok: false,
-          error: msg,
-          fetchedAt: now
-        });
+        if (probed) {
+          trace(`load\uFF1A\u590D\u7528\u8C03\u7528\u65B9\u5DF2\u63A2\u7ED3\u679C provider=${probed.providerID ?? "(\u672A\u547D\u4E2D)"}`);
+        } else {
+          await refreshActiveProvider();
+        }
+        if (!hasDetected) {
+          trace("load\uFF1A\u6D3B\u8DC3 provider \u5C1A\u672A\u63A2\u6D4B\u5230\uFF0C\u663E\u793A\u63A2\u6D4B\u4E2D");
+          setSnapshot({ provider: "", ok: false, error: "", detecting: true, fetchedAt: now });
+          scheduleRetry2();
+          return true;
+        }
+        const adapter = activeAdapter2();
+        if (!adapter) {
+          trace(`load\uFF1A\u672A\u627E\u5230\u53EF\u7528 adapter\uFF08\u7B2C ${retryCount} \u6B21\uFF0C\u5C06\u91CD\u8BD5\uFF09`);
+          setSnapshot({ provider: "\u2014", ok: false, error: "\u672A\u627E\u5230\u53EF\u7528\u7684\u5957\u9910 provider", fetchedAt: now });
+          scheduleRetry2();
+          return true;
+        }
+        retryCount = 0;
+        lastFetch = now;
+        const mySeq = ++fetchSeq;
+        try {
+          const quota = await fetchQuota(adapter, getProviders());
+          if (mySeq !== fetchSeq) {
+            trace(`\u4E22\u5F03\u8FC7\u671F\u54CD\u5E94 provider=${adapter.label} seq=${mySeq}/${fetchSeq}`);
+            return true;
+          }
+          trace(`load \u6210\u529F provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`);
+          setTitle(panelTitle2());
+          setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (mySeq !== fetchSeq) {
+            trace(`\u4E22\u5F03\u8FC7\u671F\u5931\u8D25 provider=${adapter.label} seq=${mySeq}/${fetchSeq} err=${msg}`);
+            return true;
+          }
+          trace(`load \u5931\u8D25 provider=${adapter.label} err=${msg}`);
+          setSnapshot({
+            provider: adapter.label,
+            ok: false,
+            error: msg,
+            fetchedAt: now
+          });
+        }
+        return true;
       } finally {
         inFlight = false;
       }
     }
     let sessionID;
+    let panel;
+    let renderCount = 0;
     const render = (slotProps) => {
+      renderCount += 1;
       const props = asRecord2(slotProps);
       const next = typeof props?.session_id === "string" ? props.session_id : sessionID;
+      trace(`render #${renderCount} session=${next ?? "(none)"}${panel === void 0 ? "\uFF08\u521B\u5EFA\u9762\u677F\u5B9E\u4F8B\uFF09" : "\uFF08\u590D\u7528\u5B9E\u4F8B\uFF09"}`);
       if (next !== sessionID) {
         sessionID = next;
-        trace(`render \u88AB\u8C03\u7528 session=${next ?? "(none)"}`);
         setTitle(panelTitle2());
         void load(true);
       }
-      return createComponent(QuotaPanel, {
+      return panel ??= createComponent(QuotaPanel, {
         snapshot,
         title,
         theme: api.theme,
         kv: api.kv,
-        refreshSignal: refreshTick,
         version: PLUGIN_VERSION
       });
     };
@@ -1808,11 +1835,10 @@ var tui = async (api, options) => {
       void load(true);
     });
     const offRefresh = registerRefreshCommand(api, () => {
-      setRefreshTick(Date.now());
       void load(true);
     });
     trace(`\u51C6\u5907\u6CE8\u518C\uFF0Ccandidates=${candidates().map((c) => c.id).join(",") || "(\u65E0)"}`);
-    trace(`\u51ED\u8BC1\u6765\u6E90 auth.json: ${authFileTrace()}`);
+    trace(`\u51ED\u8BC1\u6765\u6E90 auth.json: ${authFileTraceSafe()}`);
     trace(`\u5408\u5E76\u540E provider \u6761\u76EE: ${getProviders().map((p) => `${p.id}${p.baseURL ? "(\u6709baseURL)" : ""}`).join(",") || "(\u65E0)"}`);
     const dataNS = asRecord2(asRecord2(api)?.data);
     const dataOn = dataNS?.on;
@@ -1827,30 +1853,36 @@ var tui = async (api, options) => {
     const timer = setInterval(() => void load(false), intervalMs);
     const watchTimer = setInterval(() => {
       void (async () => {
+        if (stopped) return;
         const before = detectedProviderID;
         await refreshActiveProvider();
+        if (stopped) return;
         if (detectedProviderID !== before) {
           setTitle(panelTitle2());
-          void load(true);
+          if (!load(true, { providerID: detectedProviderID })) {
+            trace("watchTimer\uFF1A\u672C\u6B21 load \u88AB\u8DF3\u8FC7\uFF0C\u6392\u4E00\u8F6E\u91CD\u8BD5");
+            scheduleRetry2();
+          }
         }
       })();
     }, 3e3);
-    void dumpApiSurface(api).then((lines) => lines.forEach((l) => trace(`API ${l}`))).catch((e) => trace(`dumpApiSurface \u629B\u5F02\u5E38: ${e instanceof Error ? e.message : String(e)}`));
     const dispose = () => {
+      stopped = true;
+      if (retryTimer !== void 0) clearTimeout(retryTimer);
       clearInterval(timer);
       clearInterval(watchTimer);
       stopReady();
       offRefresh();
       offs.forEach((off) => off());
     };
-    for (const [obj, path2] of [
+    for (const [obj, path3] of [
       [api, "api.lifecycle.onDispose"],
       [asRecord2(api)?.app, "api.app.onDispose"],
       [asRecord2(api)?.renderer, "api.renderer.onDispose"]
     ]) {
       const fn = obj?.onDispose;
       if (typeof fn === "function") {
-        guard(path2, () => fn.call(obj, dispose));
+        guard(path3, () => fn.call(obj, dispose));
         break;
       }
     }

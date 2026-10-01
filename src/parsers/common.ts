@@ -52,7 +52,9 @@ function stringToMs(s: string): number | undefined {
   return Number.isNaN(parsed) ? undefined : parsed
 }
 
-function timeToMs(v: unknown): number | undefined {
+/** 归一到毫秒的容错入口（数字秒/毫秒、数字字符串、ISO 字符串）。排序键与 formatReset 必须同源，
+ *  否则会出现「按 A 时刻排序、却显示 B 时刻」的行序错乱。 */
+export function timeToMs(v: unknown): number | undefined {
   if (typeof v === "number") return normalizeEpoch(v)
   if (typeof v === "string") return stringToMs(v)
   return undefined

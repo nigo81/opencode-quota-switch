@@ -146,7 +146,14 @@ src/ui/panel.tsx               Solid 面板渲染进 api.ui.slot({prepend:"sideb
 - **模块必须同时导出 `{ id, tui, setup }`。** 只导出 `tui` 的话，模块顶层会执行但入口永不被调用（V2 宿主读的是 `setup`）。
 - **必须用 `createComponent(QuotaPanel, {...})` 在宿主的响应式 owner 内实例化**，直接调 `QuotaPanel({...})` 不建 owner、不渲染。
 - **打包必须用 `generate: "universal"` + `moduleName: "@opentui/solid"`**（默认的 `solid-js/web` 是 DOM 那套，渲染到 opentui 上不显示），且产物必须是预打包的 `dist/tui.js` —— 宿主加载 npm 缓存中的 TUI 插件走「已打包产物」路径，发裸 TS 会报 `Cannot find package 'solid-js' imported from .../src/ui/panel.tsx`。
-- **宿主不打印 setup 内的异常栈**，且 `api.lifecycle` 是 `undefined`（`@opencode-ai/plugin` 的类型声明与 v2.0.21 运行时不同步，别信它）。排查只能自己建 trace。`src/active-provider.ts` 里的 `dumpApiSurface(api)` 会在启动时把宿主 API 的真实成员打进 trace —— **改这个插件前先跑它，别猜字段名。**
+- **宿主不打印 setup 内的异常栈**，且 `api.lifecycle` 是 `undefined`（`@opencode-ai/plugin` 的类型声明与 v2.0.21 运行时不同步，别信它）。排查只能自己建 trace，**默认静默**，要开必须自己 export 环境变量：
+
+  ```bash
+  OPENCODE_QUOTA_SWITCH_TRACE=1 opencode
+  cat ~/.local/state/opencode/quota-switch.log
+  ```
+
+  日志落在 `~/.local/state/opencode/quota-switch.log`（0600，超 512KB 自动清空），home 绝对路径会被压成 `~`。**改这个插件前别猜字段名**——先把 trace 打开看宿主的真实 API 成员，踩过的坑都记在 `src/active-provider.ts` 注释里。
 
 ### GLM
 
