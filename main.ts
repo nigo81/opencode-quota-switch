@@ -30,7 +30,7 @@ function trace(msg: string): void {
     /* trace 失败不影响插件功能 */
   }
 }
-trace("=== 模块加载 ===")
+trace(`=== 模块加载 (pid=${process.pid}) ===`)
 
 type SwitchOptions = {
   /** 白名单，空/缺省 = 全部启用。值是 adapter id 或展示名 */

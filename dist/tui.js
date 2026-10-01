@@ -1204,7 +1204,7 @@ function trace(msg) {
   } catch {
   }
 }
-trace("=== \u6A21\u5757\u52A0\u8F7D ===");
+trace(`=== \u6A21\u5757\u52A0\u8F7D (pid=${process.pid}) ===`);
 function readOptions(raw) {
   const num = (v) => typeof v === "number" && Number.isFinite(v) ? v : void 0;
   const str = (v) => typeof v === "string" ? v : void 0;
