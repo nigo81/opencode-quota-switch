@@ -321,6 +321,29 @@ async function getJson(url, headers) {
     clearTimeout(timer);
   }
 }
+function parseBody(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+async function getJsonRaw(url, headers) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { method: "GET", headers, signal: controller.signal });
+    const text = await res.text();
+    return { status: res.status, body: parseBody(text) };
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error(`\u8BF7\u6C42\u8D85\u65F6\uFF08${REQUEST_TIMEOUT_MS / 1e3}s\uFF09\uFF0C\u68C0\u67E5\u7F51\u7EDC\u6216\u4EE3\u7406`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // src/parsers/common.ts
 function asRecord(v) {
@@ -635,8 +658,87 @@ var minimaxAdapter = {
   fetch: fetchMinimax
 };
 
+// src/parsers/opencode-go.ts
+var WINDOW_LABELS = { rolling: "5h", weekly: "\u5468", monthly: "\u6708" };
+function isRateLimited(entry) {
+  return entry.status === "rate-limited";
+}
+function clampPercent(pct) {
+  if (pct == null) return void 0;
+  return Math.max(0, Math.min(100, pct));
+}
+function goWindow(entry, label) {
+  const usedPct = isRateLimited(entry) ? 100 : clampPercent(toNum(entry.percent));
+  return { label, usedPct, resetLabel: formatReset(entry.resetsAt) };
+}
+function goWindows(usage) {
+  const windows = [];
+  for (const [key, label] of Object.entries(WINDOW_LABELS)) {
+    const entry = asRecord(usage[key]);
+    if (entry) windows.push(goWindow(entry, label));
+  }
+  return windows;
+}
+function parseOpenCodeGoQuota(json) {
+  const root = asRecord(json);
+  if (!root) throw new Error("\u54CD\u5E94\u4E0D\u662F JSON \u5BF9\u8C61");
+  const usage = asRecord(root.usage);
+  if (!usage) throw new Error("\u54CD\u5E94\u4E2D\u65E0 usage \u5B57\u6BB5");
+  const windows = goWindows(usage);
+  if (!windows.length) throw new Error("\u54CD\u5E94\u4E2D\u65E0 rolling/weekly/monthly \u7A97\u53E3");
+  return { windows: sortByDisplayOrder(windows), extras: [] };
+}
+
+// src/providers/opencode-go.ts
+var isOpenCodeGo = (p) => matchesAny(p.baseURL ?? "", ["zen/go"]) || matchesAny(`${p.id ?? ""} ${p.name ?? ""}`, ["opencode-go"]);
+var GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
+function bodyText(body) {
+  if (typeof body === "string") return body;
+  try {
+    return JSON.stringify(body) ?? "";
+  } catch {
+    return "";
+  }
+}
+function errorMessageOf(body) {
+  const root = asRecord(body);
+  if (!root || root.type !== "error") return void 0;
+  return strField(asRecord(root.error), "message") ?? "OpenCode Go \u63A5\u53E3\u8FD4\u56DE\u9519\u8BEF";
+}
+function deniedMessage(body) {
+  if (bodyText(body).includes("EntitlementError")) return "OpenCode Go \u672A\u8BA2\u9605";
+  return "OpenCode Go \u8BBF\u95EE\u88AB\u62D2\uFF08HTTP 403\uFF09";
+}
+async function fetchOpenCodeGo(p) {
+  if (!p.apiKey) throw new Error("OpenCode Go provider \u7F3A\u5C11 apiKey");
+  const { status, body } = await getJsonRaw(GO_USAGE_URL, {
+    Authorization: `Bearer ${p.apiKey}`,
+    Accept: "application/json"
+  });
+  if (status === 200) {
+    const message = errorMessageOf(body);
+    if (message != null) throw new Error(message);
+    return parseOpenCodeGoQuota(body);
+  }
+  if (status === 401) throw new Error("OpenCode Go \u9274\u6743\u5931\u8D25\uFF08\u68C0\u67E5 auth.json \u91CC\u7684 key\uFF09");
+  if (status === 403) throw new Error(deniedMessage(body));
+  throw new Error(`HTTP ${status}`);
+}
+var openCodeGoAdapter = {
+  id: "opencode-go",
+  label: "OpenCode Go",
+  match: isOpenCodeGo,
+  fetch: fetchOpenCodeGo
+};
+
 // src/providers/index.ts
-var PROVIDERS = [glmAdapter, minimaxAdapter, kimiAdapter, deepseekAdapter];
+var PROVIDERS = [
+  glmAdapter,
+  minimaxAdapter,
+  kimiAdapter,
+  deepseekAdapter,
+  openCodeGoAdapter
+];
 function nonEmpty(s) {
   return s != null && s.trim() !== "";
 }

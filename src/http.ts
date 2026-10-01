@@ -1,6 +1,8 @@
 // 配额查询的网络层：唯一的 fetch 出口 + provider 条目挑选工具。
 // 端口自上游 opencode-quota-usage@0.3.7 的 main.ts（getJson / hostOf / trimSlashes /
 // matchesAny / pickProvider），逐行保持等价。
+// getJsonRaw 是本仓新增的（上游没有）：控制台型接口的错误码编码在 body 里，
+// getJson 在 !res.ok 时直接抛 `HTTP ${status}` 把 body 丢了，调用方需要自己读 body 判错。
 // 凭证只从宿主 provider 列表取（ProviderLike.apiKey），绝不读 auth.json，绝不落盘或打日志。
 
 import type { ProviderLike } from "./types.js"
@@ -53,6 +55,41 @@ export async function getJson(url: string, headers: Record<string, string>): Pro
     } catch {
       throw new Error(`响应不是 JSON：${text.slice(0, 120)}`)
     }
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error(`请求超时（${REQUEST_TIMEOUT_MS / 1000}s），检查网络或代理`)
+    }
+    throw e
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 错误响应体同样可能是 JSON；解析失败退回原文，别把非 JSON 的 body 变成 undefined */
+function parseBody(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown
+  } catch {
+    return text
+  }
+}
+
+/**
+ * 不因非 2xx 抛错：返回原始 status + 解析后的 body，让调用方自己判 body 里的错误码。
+ * 控制台型接口的成功与否编码在 body 里，且 403 必须读 body 才知道原因（未订阅 vs 访问被拒）。
+ * 仅在网络异常/超时时抛错（复用 REQUEST_TIMEOUT_MS 与 AbortError 文案）。
+ * 刻意不复用 getJson：改它的抛错行为会连带影响已跑通的四家。
+ */
+export async function getJsonRaw(
+  url: string,
+  headers: Record<string, string>,
+): Promise<{ status: number; body: unknown }> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  try {
+    const res = await fetch(url, { method: "GET", headers, signal: controller.signal })
+    const text = await res.text()
+    return { status: res.status, body: parseBody(text) }
   } catch (e) {
     if (e instanceof Error && e.name === "AbortError") {
       throw new Error(`请求超时（${REQUEST_TIMEOUT_MS / 1000}s），检查网络或代理`)

@@ -10,11 +10,12 @@ import { deepseekAdapter } from "./deepseek.js"
 import { glmAdapter } from "./glm.js"
 import { kimiAdapter } from "./kimi.js"
 import { minimaxAdapter } from "./minimax.js"
+import { openCodeGoAdapter } from "./opencode-go.js"
 
 export type ProviderAdapter = {
-  /** stable id, e.g. "glm" | "minimax" | "kimi" | "deepseek" */
+  /** stable id, e.g. "glm" | "minimax" | "kimi" | "deepseek" | "opencode-go" */
   id: string
-  /** display name, e.g. "GLM" | "MiniMax" | "Kimi" | "DeepSeek" */
+  /** display name, e.g. "GLM" | "MiniMax" | "Kimi" | "DeepSeek" | "OpenCode Go" */
   label: string
   /** does this host provider entry belong to this adapter? */
   match: (p: ProviderLike) => boolean
@@ -23,10 +24,16 @@ export type ProviderAdapter = {
   fetch: (p: ProviderLike) => Promise<ProviderQuota>
 }
 
-export { deepseekAdapter, glmAdapter, kimiAdapter, minimaxAdapter }
+export { deepseekAdapter, glmAdapter, kimiAdapter, minimaxAdapter, openCodeGoAdapter }
 
-/** 面板展示顺序：GLM、MiniMax、Kimi、DeepSeek */
-export const PROVIDERS: readonly ProviderAdapter[] = [glmAdapter, minimaxAdapter, kimiAdapter, deepseekAdapter]
+/** 面板展示顺序：GLM、MiniMax、Kimi、DeepSeek、OpenCode Go */
+export const PROVIDERS: readonly ProviderAdapter[] = [
+  glmAdapter,
+  minimaxAdapter,
+  kimiAdapter,
+  deepseekAdapter,
+  openCodeGoAdapter,
+]
 
 function nonEmpty(s: string | undefined): boolean {
   return s != null && s.trim() !== ""
@@ -71,7 +78,7 @@ export function fetchQuota(adapter: ProviderAdapter, providers: readonly Provide
 
 /**
  * 该条目是否已具备可用凭证。
- * 四家 adapter 现在都带兜底站点（见各自 DEFAULT_* 常量），所以只要有 apiKey 就能定位接口，
+ * 五家 adapter 现在都带兜底站点（见各自 DEFAULT_* 常量 / 固定 URL 常量），所以只要有 apiKey 就能定位接口，
  * baseURL 缺失不再是阻塞——这是 v2.0.21 宿主没有 api.state、只能从 auth.json 取 key 的前提。
  */
 function usableEntry(adapter: ProviderAdapter, p: ProviderLike | undefined): boolean {
