@@ -54,22 +54,33 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined
 }
 
-/** 宿主 provider 条目 → 最小形状（逐字段收窄，不信任 SDK 类型） */
-function hostProviders(api: TuiPluginApi): ProviderLike[] {
-  return api.state.provider.map((p: unknown): ProviderLike => {
-    const rec = asRecord(p)
-    const options = asRecord(rec?.options)
-    const id = rec?.id
-    const name = rec?.name
-    const baseURL = options?.baseURL
-    const apiKey = options?.apiKey
-    return {
-      id: typeof id === "string" ? id : undefined,
-      name: typeof name === "string" ? name : undefined,
-      baseURL: typeof baseURL === "string" ? baseURL : undefined,
-      apiKey: typeof apiKey === "string" ? apiKey : undefined,
-    }
-  })
+/**
+ * 宿主 provider 条目 → 最小形状（逐字段收窄，不信任 SDK 类型）。
+ *
+ * 必须在调用时惰性读取：v2 宿主调用 setup 时 `api.state` 还是 undefined
+ * （实测 TypeError: undefined is not an object (evaluating 'api.state.provider')），
+ * 且宿主不打印 setup 内的异常栈，setup 静默中断 → 插件完全无表现。
+ * 所以这里只记下 getter，不在 setup 阶段取值。
+ */
+function hostProviders(api: TuiPluginApi): () => ProviderLike[] {
+  return () => {
+    const list = (api as { state?: { provider?: readonly unknown[] } }).state?.provider
+    if (!Array.isArray(list)) return []
+    return list.map((p: unknown): ProviderLike => {
+      const rec = asRecord(p)
+      const options = asRecord(rec?.options)
+      const id = rec?.id
+      const name = rec?.name
+      const baseURL = options?.baseURL
+      const apiKey = options?.apiKey
+      return {
+        id: typeof id === "string" ? id : undefined,
+        name: typeof name === "string" ? name : undefined,
+        baseURL: typeof baseURL === "string" ? baseURL : undefined,
+        apiKey: typeof apiKey === "string" ? apiKey : undefined,
+      }
+    })
+  }
 }
 
 /**
@@ -173,47 +184,73 @@ function whenRendererReady(api: TuiPluginApi, run: () => void): () => void {
 
 const tui: TuiPlugin = async (api, options) => {
  try {
-  trace(`setup 开始 renderer.isRunning=${String(api.renderer?.isRunning)}`)
+  trace(`setup 开始 renderer=${String(api.renderer?.isRunning)}`)
+  // 排障用：把宿主实际给了什么打出来。setup 阶段 api.state 为 undefined，
+  // 与类型声明（api.state: TuiState）不符，故不能假设字段一定存在。
+  trace(`api 成员: ${Object.keys(api as unknown as Record<string, unknown>).join(",")}`)
+  trace(
+    `api 子成员: ui=[${Object.keys((api.ui ?? {}) as Record<string, unknown>).join(",")}] ` +
+      `slots=[${Object.keys((api.slots ?? {}) as Record<string, unknown>).join(",")}]`,
+  )
   const opts = readOptions(options as Record<string, unknown> | undefined)
   const intervalMs = Math.max(15_000, opts.intervalMs ?? 60_000)
-  const providers = hostProviders(api)
-  trace(`hostProviders: ${providers.length} 个`)
+  // 惰性读取：setup 阶段 api.state 还是 undefined，不能在这里取值
+  const getProviders = hostProviders(api)
   const allowed = opts.providers
-  const candidates = availableAdapters(providers).filter(
-    (a) => !allowed || allowed.length === 0 || allowed.some((n) => n === a.id || n === a.label),
-  )
+  const candidates = (): ReturnType<typeof availableAdapters> =>
+    availableAdapters(getProviders()).filter(
+      (a) => !allowed || allowed.length === 0 || allowed.some((n) => n === a.id || n === a.label),
+    )
 
   const [snapshot, setSnapshot] = createSignal<QuotaSnapshot | null>(null)
   const [title, setTitle] = createSignal(opts.title ?? "套餐用量")
   const [refreshTick, setRefreshTick] = createSignal(0)
 
   // 活跃 provider：会话内最近一条消息优先，其次配置默认模型
+  // api.state 在 setup 阶段为 undefined，所有访问都走可选链
   function activeAdapter(sessionID: string | undefined) {
-    const messages = sessionID ? api.state.session.messages(sessionID) : []
-    const active = resolveActiveProvider({ messages, config: api.state.config })
+    const st = (api as { state?: { session?: { messages?: (id: string) => readonly unknown[] }; config?: unknown } })
+      .state
+    let messages: readonly unknown[] = []
+    try {
+      const m = sessionID ? st?.session?.messages?.(sessionID) : undefined
+      if (Array.isArray(m)) messages = m
+    } catch {
+      messages = []
+    }
+    const active = resolveActiveProvider({ messages, config: st?.config })
     const byId = active.providerID ? adapterForProviderId(active.providerID) : undefined
+    const list = candidates()
     // 判定到的 provider 不在候选里（未认证/被白名单排除）→ 回落到首个可用 adapter
-    const fallback = candidates[0]
-    const chosen = byId && candidates.includes(byId) ? byId : byId ?? fallback
-    return chosen
+    return byId && list.includes(byId) ? byId : (byId ?? list[0])
   }
 
   let lastFetch = 0
   let inFlight = false
+  let retryCount = 0
+  /** 宿主填充 api.state 是异步的，首次取数可能扑空，阶梯重试几次 */
+  function scheduleRetry(sessionID: string | undefined): void {
+    if (retryCount >= 6) return
+    const delay = Math.min(4000, 300 * 2 ** retryCount)
+    retryCount += 1
+    setTimeout(() => void load(sessionID, true), delay)
+  }
   async function load(sessionID: string | undefined, force: boolean): Promise<void> {
     const now = Date.now()
     if (!force && now - lastFetch < intervalMs - 1000) return
     if (inFlight) return
     const adapter = activeAdapter(sessionID)
     if (!adapter) {
-      trace("load：未找到可用 adapter")
+      trace(`load：未找到可用 adapter（第 ${retryCount} 次，将重试）`)
       setSnapshot({ provider: "—", ok: false, error: "未找到可用的套餐 provider", fetchedAt: now })
+      scheduleRetry(sessionID)
       return
     }
+    retryCount = 0
     inFlight = true
     lastFetch = now
     try {
-      const quota = await fetchQuota(adapter, providers)
+      const quota = await fetchQuota(adapter, getProviders())
       trace(`load 成功 provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`)
       setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now })
     } catch (e) {
@@ -271,7 +308,7 @@ const tui: TuiPlugin = async (api, options) => {
   })
 
   // 消息更新 = 可能换 provider；空闲 = 一次问答结束，两个都要重新判定
-  trace(`准备注册，candidates=${candidates.map((c) => c.id).join(",") || "(无)"}`)
+  trace(`准备注册，candidates=${candidates().map((c) => c.id).join(",") || "(无)"}`)
   const offs = [
     api.event.on("message.updated", () => void load(sessionID, false)),
     api.event.on("session.updated", () => void load(sessionID, false)),

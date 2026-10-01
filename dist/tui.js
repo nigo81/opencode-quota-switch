@@ -1215,20 +1215,24 @@ function asRecord3(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v) ? v : void 0;
 }
 function hostProviders(api) {
-  return api.state.provider.map((p) => {
-    const rec = asRecord3(p);
-    const options = asRecord3(rec?.options);
-    const id = rec?.id;
-    const name = rec?.name;
-    const baseURL = options?.baseURL;
-    const apiKey = options?.apiKey;
-    return {
-      id: typeof id === "string" ? id : void 0,
-      name: typeof name === "string" ? name : void 0,
-      baseURL: typeof baseURL === "string" ? baseURL : void 0,
-      apiKey: typeof apiKey === "string" ? apiKey : void 0
-    };
-  });
+  return () => {
+    const list = api.state?.provider;
+    if (!Array.isArray(list)) return [];
+    return list.map((p) => {
+      const rec = asRecord3(p);
+      const options = asRecord3(rec?.options);
+      const id = rec?.id;
+      const name = rec?.name;
+      const baseURL = options?.baseURL;
+      const apiKey = options?.apiKey;
+      return {
+        id: typeof id === "string" ? id : void 0,
+        name: typeof name === "string" ? name : void 0,
+        baseURL: typeof baseURL === "string" ? baseURL : void 0,
+        apiKey: typeof apiKey === "string" ? apiKey : void 0
+      };
+    });
+  };
 }
 function registerSidebarSlot(api, render) {
   try {
@@ -1314,21 +1318,35 @@ function whenRendererReady(api, run) {
 var tui = async (api, options) => {
   try {
     let activeAdapter2 = function(sessionID2) {
-      const messages = sessionID2 ? api.state.session.messages(sessionID2) : [];
-      const active = resolveActiveProvider({ messages, config: api.state.config });
+      const st = api.state;
+      let messages = [];
+      try {
+        const m = sessionID2 ? st?.session?.messages?.(sessionID2) : void 0;
+        if (Array.isArray(m)) messages = m;
+      } catch {
+        messages = [];
+      }
+      const active = resolveActiveProvider({ messages, config: st?.config });
       const byId = active.providerID ? adapterForProviderId(active.providerID) : void 0;
-      const fallback = candidates[0];
-      const chosen = byId && candidates.includes(byId) ? byId : byId ?? fallback;
-      return chosen;
+      const list = candidates();
+      return byId && list.includes(byId) ? byId : byId ?? list[0];
+    }, scheduleRetry2 = function(sessionID2) {
+      if (retryCount >= 6) return;
+      const delay = Math.min(4e3, 300 * 2 ** retryCount);
+      retryCount += 1;
+      setTimeout(() => void load(sessionID2, true), delay);
     };
-    var activeAdapter = activeAdapter2;
-    trace(`setup \u5F00\u59CB renderer.isRunning=${String(api.renderer?.isRunning)}`);
+    var activeAdapter = activeAdapter2, scheduleRetry = scheduleRetry2;
+    trace(`setup \u5F00\u59CB renderer=${String(api.renderer?.isRunning)}`);
+    trace(`api \u6210\u5458: ${Object.keys(api).join(",")}`);
+    trace(
+      `api \u5B50\u6210\u5458: ui=[${Object.keys(api.ui ?? {}).join(",")}] slots=[${Object.keys(api.slots ?? {}).join(",")}]`
+    );
     const opts = readOptions(options);
     const intervalMs = Math.max(15e3, opts.intervalMs ?? 6e4);
-    const providers = hostProviders(api);
-    trace(`hostProviders: ${providers.length} \u4E2A`);
+    const getProviders = hostProviders(api);
     const allowed = opts.providers;
-    const candidates = availableAdapters(providers).filter(
+    const candidates = () => availableAdapters(getProviders()).filter(
       (a) => !allowed || allowed.length === 0 || allowed.some((n) => n === a.id || n === a.label)
     );
     const [snapshot, setSnapshot] = createSignal2(null);
@@ -1336,20 +1354,23 @@ var tui = async (api, options) => {
     const [refreshTick, setRefreshTick] = createSignal2(0);
     let lastFetch = 0;
     let inFlight = false;
+    let retryCount = 0;
     async function load(sessionID2, force) {
       const now = Date.now();
       if (!force && now - lastFetch < intervalMs - 1e3) return;
       if (inFlight) return;
       const adapter = activeAdapter2(sessionID2);
       if (!adapter) {
-        trace("load\uFF1A\u672A\u627E\u5230\u53EF\u7528 adapter");
+        trace(`load\uFF1A\u672A\u627E\u5230\u53EF\u7528 adapter\uFF08\u7B2C ${retryCount} \u6B21\uFF0C\u5C06\u91CD\u8BD5\uFF09`);
         setSnapshot({ provider: "\u2014", ok: false, error: "\u672A\u627E\u5230\u53EF\u7528\u7684\u5957\u9910 provider", fetchedAt: now });
+        scheduleRetry2(sessionID2);
         return;
       }
+      retryCount = 0;
       inFlight = true;
       lastFetch = now;
       try {
-        const quota = await fetchQuota(adapter, providers);
+        const quota = await fetchQuota(adapter, getProviders());
         trace(`load \u6210\u529F provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`);
         setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now });
       } catch (e) {
@@ -1398,7 +1419,7 @@ var tui = async (api, options) => {
       setRefreshTick(Date.now());
       void load(sessionID, true);
     });
-    trace(`\u51C6\u5907\u6CE8\u518C\uFF0Ccandidates=${candidates.map((c) => c.id).join(",") || "(\u65E0)"}`);
+    trace(`\u51C6\u5907\u6CE8\u518C\uFF0Ccandidates=${candidates().map((c) => c.id).join(",") || "(\u65E0)"}`);
     const offs = [
       api.event.on("message.updated", () => void load(sessionID, false)),
       api.event.on("session.updated", () => void load(sessionID, false)),
