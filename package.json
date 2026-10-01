@@ -3,12 +3,17 @@
   "version": "0.1.0",
   "description": "OpenCode TUI plugin — sidebar quota panel that follows the active provider (GLM / MiniMax / Kimi / DeepSeek)",
   "type": "module",
+  "main": "dist/tui.js",
   "exports": {
-    "./tui": "./main.ts"
+    "./tui": {
+      "import": "./dist/tui.js",
+      "config": {
+        "enabled": true
+      }
+    }
   },
   "files": [
-    "main.ts",
-    "src",
+    "dist",
     "README.md"
   ],
   "keywords": [
@@ -27,15 +32,20 @@
   "engines": {
     "opencode": ">=1.17.0"
   },
-  "comment:dependencies": "CRITICAL: keep `dependencies` EMPTY. @opentui/core + solid-js + @opentui/solid must stay host-provided (devDependencies only). Shipping our own copy creates a second render library instance; Solid signal subscriptions cannot bridge to the host render loop and the panel freezes on the first frame (this is why upstream opencode-quota-usage had to drop to imperative rendering — it pinned @opentui/core in dependencies).",
+  "comment:dependencies": "CRITICAL — 两层约束，缺一不可：\n(1) dependencies 必须为空。solid-js / @opentui/solid / @opentui/core 全部 external，由宿主提供单实例。自带一份会出现两个渲染库实例，Solid 信号桥接不到宿主渲染循环，UI 冻结在首帧。\n(2) 也不要写 peerDependencies。宿主会按 peer 依赖实际安装并带上自己的版本树，与宿主侧那份冲突。\n运行时依赖必须保持 external 的实现方式见 build.mjs。",
   "dependencies": {},
-  "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.17.0"
-  },
   "devDependencies": {
     "@opencode-ai/plugin": "1.15.10",
     "@opentui/solid": "0.2.15",
+    "esbuild": "^0.25.12",
+    "esbuild-plugin-solid": "^0.5.0",
     "solid-js": "1.9.12",
     "typescript": "^5.8.2"
+  },
+  "scripts": {
+    "build": "tsc --noEmit && node build.mjs",
+    "build:tui": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   }
 }
