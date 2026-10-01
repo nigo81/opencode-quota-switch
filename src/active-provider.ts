@@ -1,82 +1,182 @@
 /**
- * 活跃 provider 判定：从当前会话的消息里反推「用户正在用哪个 provider」。
+ * 活跃 provider 探测：v2.0.21 宿主没有 api.state，原来的「读会话最后一条消息」路线彻底失效
+ * （trace 实测 `render 被调用 session=(none)`，槽位 render 回调根本不传 session_id）。
  *
- * 刻意做成零依赖纯函数（不 import solid-js、不 import SDK 类型）：
- * 消息按 role 逐字段收窄，契约是运行时收窄而非类型断言——
- * 这样判定逻辑可以脱离 TUI 宿主离线验证。
+ * 真实可用入口（trace 实测成员）：
+ *   api.client = { server, location, agent, plugin, session, message, model, generate,
+ *                  provider, integration, mcp, credential, project, form, permission,
+ *                  file, command, skill, rpc, event }
+ *   api.data   = { on, listen, session, project, shell, location }
+ *   api.ui     = { dialog, toast, format, router, panel, tabs, model, slot }
  *
- * 优先级：会话内最近一条消息 > 全局配置默认模型。
- * 新会话尚无消息时回落到配置默认值。
+ * 判定优先级：ui.model 的当前模型 → client.session 当前会话的最近消息 → client.model 列表推断。
+ * 全部走可选链 + try/catch，任何一层不存在就退到下一层。
  */
 
-/** 取对象视图，非对象（含数组/null）一律 undefined */
-function asRecord(v: unknown): Record<string, unknown> | undefined {
-  return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined
+type Rec = Record<string, unknown>
+
+function rec(v: unknown): Rec | undefined {
+  return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Rec) : undefined
 }
 
-function strField(obj: Record<string, unknown> | undefined, key: string): string | undefined {
-  const v = obj?.[key]
-  return typeof v === "string" && v !== "" ? v : undefined
+/** 广度一层地把对象里的零参函数结果打出来，只看形状不回显敏感字段 */
+function shapeOf(v: unknown, depth = 0): string {
+  if (v === null) return "null"
+  if (v === undefined) return "undefined"
+  if (Array.isArray(v)) {
+    if (v.length === 0) return "[]"
+    return `array(${v.length})<${shapeOf(v[0], depth + 1)}>`
+  }
+  if (typeof v === "function") return "function"
+  if (typeof v !== "object") return typeof v
+  if (depth >= 2) return "{…}"
+  return `{${Object.keys(v as Rec)
+    .slice(0, 12)
+    .map((k) => `${k}:${shapeOf((v as Rec)[k], depth + 1)}`)
+    .join(",")}}`
 }
 
-/**
- * 从消息列表倒序找最近一条带 providerID 的消息。
- *
- * 两条判别路径：
- * - role=assistant → 顶层 `providerID`（必填）
- * - role=user      → `model.providerID`（可选，用户可能没记模型）
- *
- * 倒序遍历：时间正序遍历会在新消息尚未落库时返回旧 provider，产生闪跳。
- */
-export function providerIdFromMessages(messages: readonly unknown[]): string | undefined {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const msg = asRecord(messages[i])
-    if (!msg) continue
-    const role = strField(msg, "role")
-    if (role === "assistant") {
-      const direct = strField(msg, "providerID")
-      if (direct) return direct
-      continue
+/** 在一个命名空间里找出看起来像「当前模型」的字段 */
+function pickProviderIDFromModelLike(m: unknown): string | undefined {
+  const r = rec(m)
+  if (!r) return undefined
+  for (const key of ["providerID", "providerId", "provider_id"]) {
+    const v = r[key]
+    if (typeof v === "string" && v !== "") return v
+  }
+  // 模型条目常带 { info: { providerID } } 或 { modelID: "provider/model" }
+  const info = rec(r.info)
+  if (info) {
+    for (const key of ["providerID", "providerId"]) {
+      const v = info[key]
+      if (typeof v === "string" && v !== "") return v
     }
-    if (role === "user") {
-      const nested = strField(asRecord(msg.model), "providerID")
-      if (nested) return nested
+  }
+  for (const key of ["modelID", "modelId", "id"]) {
+    const v = r[key]
+    if (typeof v === "string" && v.includes("/")) return v.split("/")[0]
+  }
+  return undefined
+}
+
+/** 从会话消息里取最近一条带 providerID 的消息 */
+function providerIDFromMessages(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const r = rec(messages[i])
+    if (!r) continue
+    const direct = pickProviderIDFromModelLike(r)
+    if (direct) return direct
+    const info = rec(r.info)
+    if (info) {
+      const v = pickProviderIDFromModelLike(info)
+      if (v) return v
     }
   }
   return undefined
 }
 
+export type ProbeResult = {
+  providerID?: string
+  /** 每层探测的结论，写进 trace 便于排障 */
+  notes: string[]
+}
+
 /**
- * 从配置默认模型取 providerID。
- * `config.model` 形如 "minimax-cn-coding-plan/MiniMax-M3.1-Flash-Preview"，
- * 取斜杠前段即 providerID。`small_model` 作为次选（摘要用的小模型通常同 provider，
- * 但配置里可能只填了 small_model）。
+ * 依次尝试各条判定路径。全程只读，不写宿主状态。
+ * @param preferIDs 上层已知的候选（来自 render props 等），命中就直接用
  */
-export function providerIdFromConfig(config: unknown): string | undefined {
-  const rec = asRecord(config)
-  if (!rec) return undefined
-  for (const key of ["model", "small_model"] as const) {
-    const raw = strField(rec, key)
-    if (!raw) continue
-    const head = raw.split("/")[0]?.trim()
-    if (head) return head
+export async function detectActiveProvider(api: unknown, preferIDs: (string | undefined)[] = []): Promise<ProbeResult> {
+  const notes: string[] = []
+  for (const id of preferIDs) {
+    if (typeof id === "string" && id !== "") {
+      notes.push(`render props 直接给出 ${id}`)
+      return { providerID: id, notes }
+    }
   }
-  return undefined
-}
 
-export type ActiveProvider = {
-  providerID: string | undefined
-  /** 判定来源，用于排查「为什么显示了别的 provider」 */
-  source: "message" | "config" | "none"
-}
+  const a = rec(api) ?? {}
+  const ui = rec(a.ui) ?? {}
+  const client = rec(a.client) ?? {}
 
-export function resolveActiveProvider(input: {
-  messages: readonly unknown[]
-  config: unknown
-}): ActiveProvider {
-  const fromMessage = providerIdFromMessages(input.messages)
-  if (fromMessage) return { providerID: fromMessage, source: "message" }
-  const fromConfig = providerIdFromConfig(input.config)
-  if (fromConfig) return { providerID: fromConfig, source: "config" }
-  return { providerID: undefined, source: "none" }
+  // 第 1 层：ui.model —— TUI 自己就知道当前选中的模型
+  const uiModel = rec(ui.model) ?? {}
+  for (const key of ["current", "selected", "active", "value"]) {
+    const id = pickProviderIDFromModelLike(uiModel[key])
+    if (id) {
+      notes.push(`api.ui.model.${key} → ${id}`)
+      return { providerID: id, notes }
+    }
+  }
+  notes.push(`api.ui.model 成员=[${Object.keys(uiModel).join(",")}] 无 current/selected`)
+
+  // 第 2 层：client.session 当前会话的最近消息
+  const sessionNS = rec(client.session) ?? {}
+  try {
+    const listFn = sessionNS.list as (() => Promise<unknown>) | undefined
+    if (typeof listFn === "function") {
+      const list = await listFn.call(sessionNS)
+      const arr = Array.isArray(list) ? list : ((rec(list)?.data as unknown[] | undefined) ?? [])
+      const first = rec(arr[0])
+      const infoRec = rec(first?.info)
+      const sid = first?.id ?? first?.sessionID ?? infoRec?.id
+      if (typeof sid === "string") {
+        const getFn = sessionNS.get as ((id: string) => Promise<unknown>) | undefined
+        if (typeof getFn === "function") {
+          const s = await getFn.call(sessionNS, sid)
+          const id = providerIDFromMessages(rec(s)?.messages)
+          if (id) {
+            notes.push(`api.client.session.get(${sid}) 最近消息 → ${id}`)
+            return { providerID: id, notes }
+          }
+          notes.push(`api.client.session.get(${sid}) 消息里没有 providerID（shape=${shapeOf(s)}）`)
+        }
+      } else {
+        notes.push(`api.client.session.list() 拿不到 session id（shape=${shapeOf(list)}）`)
+      }
+    } else {
+      notes.push(`api.client.session 无 list()，成员=[${Object.keys(sessionNS).join(",")}]`)
+    }
+  } catch (e) {
+    notes.push(`api.client.session 抛异常: ${e instanceof Error ? e.message : String(e)}`)
+  }
+
+  // 第 3 层：api.data.session
+  try {
+    const dataSession = rec(rec(a.data)?.session) ?? {}
+    for (const key of Object.keys(dataSession)) {
+      const v = dataSession[key]
+      if (typeof v === "function" && key !== "get" && key !== "select") {
+        const r = await (v as () => Promise<unknown>).call(dataSession)
+        const id = pickProviderIDFromModelLike(r) ?? providerIDFromMessages(r)
+        if (id) {
+          notes.push(`api.data.session.${key}() → ${id}`)
+          return { providerID: id, notes }
+        }
+      }
+    }
+    notes.push(`api.data.session 成员=[${Object.keys(dataSession).join(",")}] 未命中`)
+  } catch (e) {
+    notes.push(`api.data.session 抛异常: ${e instanceof Error ? e.message : String(e)}`)
+  }
+
+  // 第 4 层：client.model 列表 —— 没有「当前」就退而求其次，看能否列出全部 providerID
+  try {
+    const modelNS = rec(client.model) ?? {}
+    const listFn = (modelNS.list ?? modelNS.available) as (() => Promise<unknown>) | undefined
+    if (typeof listFn === "function") {
+      const list = await listFn.call(modelNS)
+      const arr = Array.isArray(list) ? list : []
+      const ids = new Set<string>()
+      for (const m of arr) {
+        const id = pickProviderIDFromModelLike(m)
+        if (id) ids.add(id)
+      }
+      notes.push(`api.client.model 列表里出现的 providerID=[${[...ids].join(",")}]（无「当前」语义，仅供对照）`)
+    }
+  } catch (e) {
+    notes.push(`api.client.model 抛异常: ${e instanceof Error ? e.message : String(e)}`)
+  }
+
+  return { notes }
 }

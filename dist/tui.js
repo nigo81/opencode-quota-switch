@@ -4,47 +4,139 @@ import { createComponent } from "@opentui/solid";
 import fs2 from "node:fs";
 
 // src/active-provider.ts
-function asRecord(v) {
+function rec(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v) ? v : void 0;
 }
-function strField(obj, key) {
-  const v = obj?.[key];
-  return typeof v === "string" && v !== "" ? v : void 0;
+function shapeOf(v, depth = 0) {
+  if (v === null) return "null";
+  if (v === void 0) return "undefined";
+  if (Array.isArray(v)) {
+    if (v.length === 0) return "[]";
+    return `array(${v.length})<${shapeOf(v[0], depth + 1)}>`;
+  }
+  if (typeof v === "function") return "function";
+  if (typeof v !== "object") return typeof v;
+  if (depth >= 2) return "{\u2026}";
+  return `{${Object.keys(v).slice(0, 12).map((k) => `${k}:${shapeOf(v[k], depth + 1)}`).join(",")}}`;
 }
-function providerIdFromMessages(messages) {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const msg = asRecord(messages[i]);
-    if (!msg) continue;
-    const role = strField(msg, "role");
-    if (role === "assistant") {
-      const direct = strField(msg, "providerID");
-      if (direct) return direct;
-      continue;
+function pickProviderIDFromModelLike(m) {
+  const r = rec(m);
+  if (!r) return void 0;
+  for (const key of ["providerID", "providerId", "provider_id"]) {
+    const v = r[key];
+    if (typeof v === "string" && v !== "") return v;
+  }
+  const info = rec(r.info);
+  if (info) {
+    for (const key of ["providerID", "providerId"]) {
+      const v = info[key];
+      if (typeof v === "string" && v !== "") return v;
     }
-    if (role === "user") {
-      const nested = strField(asRecord(msg.model), "providerID");
-      if (nested) return nested;
+  }
+  for (const key of ["modelID", "modelId", "id"]) {
+    const v = r[key];
+    if (typeof v === "string" && v.includes("/")) return v.split("/")[0];
+  }
+  return void 0;
+}
+function providerIDFromMessages(messages) {
+  if (!Array.isArray(messages)) return void 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const r = rec(messages[i]);
+    if (!r) continue;
+    const direct = pickProviderIDFromModelLike(r);
+    if (direct) return direct;
+    const info = rec(r.info);
+    if (info) {
+      const v = pickProviderIDFromModelLike(info);
+      if (v) return v;
     }
   }
   return void 0;
 }
-function providerIdFromConfig(config) {
-  const rec = asRecord(config);
-  if (!rec) return void 0;
-  for (const key of ["model", "small_model"]) {
-    const raw = strField(rec, key);
-    if (!raw) continue;
-    const head = raw.split("/")[0]?.trim();
-    if (head) return head;
+async function detectActiveProvider(api, preferIDs = []) {
+  const notes = [];
+  for (const id of preferIDs) {
+    if (typeof id === "string" && id !== "") {
+      notes.push(`render props \u76F4\u63A5\u7ED9\u51FA ${id}`);
+      return { providerID: id, notes };
+    }
   }
-  return void 0;
-}
-function resolveActiveProvider(input) {
-  const fromMessage = providerIdFromMessages(input.messages);
-  if (fromMessage) return { providerID: fromMessage, source: "message" };
-  const fromConfig = providerIdFromConfig(input.config);
-  if (fromConfig) return { providerID: fromConfig, source: "config" };
-  return { providerID: void 0, source: "none" };
+  const a = rec(api) ?? {};
+  const ui = rec(a.ui) ?? {};
+  const client = rec(a.client) ?? {};
+  const uiModel = rec(ui.model) ?? {};
+  for (const key of ["current", "selected", "active", "value"]) {
+    const id = pickProviderIDFromModelLike(uiModel[key]);
+    if (id) {
+      notes.push(`api.ui.model.${key} \u2192 ${id}`);
+      return { providerID: id, notes };
+    }
+  }
+  notes.push(`api.ui.model \u6210\u5458=[${Object.keys(uiModel).join(",")}] \u65E0 current/selected`);
+  const sessionNS = rec(client.session) ?? {};
+  try {
+    const listFn = sessionNS.list;
+    if (typeof listFn === "function") {
+      const list = await listFn.call(sessionNS);
+      const arr = Array.isArray(list) ? list : rec(list)?.data ?? [];
+      const first = rec(arr[0]);
+      const infoRec = rec(first?.info);
+      const sid = first?.id ?? first?.sessionID ?? infoRec?.id;
+      if (typeof sid === "string") {
+        const getFn = sessionNS.get;
+        if (typeof getFn === "function") {
+          const s = await getFn.call(sessionNS, sid);
+          const id = providerIDFromMessages(rec(s)?.messages);
+          if (id) {
+            notes.push(`api.client.session.get(${sid}) \u6700\u8FD1\u6D88\u606F \u2192 ${id}`);
+            return { providerID: id, notes };
+          }
+          notes.push(`api.client.session.get(${sid}) \u6D88\u606F\u91CC\u6CA1\u6709 providerID\uFF08shape=${shapeOf(s)}\uFF09`);
+        }
+      } else {
+        notes.push(`api.client.session.list() \u62FF\u4E0D\u5230 session id\uFF08shape=${shapeOf(list)}\uFF09`);
+      }
+    } else {
+      notes.push(`api.client.session \u65E0 list()\uFF0C\u6210\u5458=[${Object.keys(sessionNS).join(",")}]`);
+    }
+  } catch (e) {
+    notes.push(`api.client.session \u629B\u5F02\u5E38: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    const dataSession = rec(rec(a.data)?.session) ?? {};
+    for (const key of Object.keys(dataSession)) {
+      const v = dataSession[key];
+      if (typeof v === "function" && key !== "get" && key !== "select") {
+        const r = await v.call(dataSession);
+        const id = pickProviderIDFromModelLike(r) ?? providerIDFromMessages(r);
+        if (id) {
+          notes.push(`api.data.session.${key}() \u2192 ${id}`);
+          return { providerID: id, notes };
+        }
+      }
+    }
+    notes.push(`api.data.session \u6210\u5458=[${Object.keys(dataSession).join(",")}] \u672A\u547D\u4E2D`);
+  } catch (e) {
+    notes.push(`api.data.session \u629B\u5F02\u5E38: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    const modelNS = rec(client.model) ?? {};
+    const listFn = modelNS.list ?? modelNS.available;
+    if (typeof listFn === "function") {
+      const list = await listFn.call(modelNS);
+      const arr = Array.isArray(list) ? list : [];
+      const ids = /* @__PURE__ */ new Set();
+      for (const m of arr) {
+        const id = pickProviderIDFromModelLike(m);
+        if (id) ids.add(id);
+      }
+      notes.push(`api.client.model \u5217\u8868\u91CC\u51FA\u73B0\u7684 providerID=[${[...ids].join(",")}]\uFF08\u65E0\u300C\u5F53\u524D\u300D\u8BED\u4E49\uFF0C\u4EC5\u4F9B\u5BF9\u7167\uFF09`);
+    }
+  } catch (e) {
+    notes.push(`api.client.model \u629B\u5F02\u5E38: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return { notes };
 }
 
 // src/authfile.ts
@@ -145,7 +237,7 @@ async function getJson(url, headers) {
 }
 
 // src/parsers/common.ts
-function asRecord2(v) {
+function asRecord(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v) ? v : void 0;
 }
 function toNum(v) {
@@ -158,14 +250,14 @@ function toNum(v) {
   }
   return void 0;
 }
-function strField2(obj, key) {
+function strField(obj, key) {
   const v = obj?.[key];
   return typeof v === "string" ? v : void 0;
 }
 function limitsOf(data) {
   const raw = data.limits;
   if (!Array.isArray(raw)) return [];
-  return raw.map(asRecord2);
+  return raw.map(asRecord);
 }
 function pctOf(used, limit) {
   if (used == null || limit == null || limit <= 0) return void 0;
@@ -221,10 +313,10 @@ function balanceText(currency, balance) {
   throw new Error("balance_infos.total_balance \u7C7B\u578B\u5F02\u5E38\uFF08\u975E string/number\uFF09");
 }
 function parseDeepSeekBalance(json) {
-  const root = asRecord2(json);
+  const root = asRecord(json);
   if (!root) throw new Error("\u54CD\u5E94\u4E0D\u662F JSON \u5BF9\u8C61");
   if (root.is_available === false) throw new Error("\u8D26\u53F7\u4E0D\u53EF\u7528");
-  const infos = Array.isArray(root.balance_infos) ? root.balance_infos.map(asRecord2).filter((r) => r != null) : [];
+  const infos = Array.isArray(root.balance_infos) ? root.balance_infos.map(asRecord).filter((r) => r != null) : [];
   const cny = infos.find((i) => i?.currency === "CNY") ?? infos[0];
   if (!cny) throw new Error("\u54CD\u5E94\u4E2D\u65E0 balance_infos");
   return { windows: [], extras: [{ label: "\u4F59\u989D", value: balanceText(cny.currency, cny.total_balance) }] };
@@ -284,13 +376,13 @@ function glmWindows(data) {
   return sortByDisplayOrder(windows);
 }
 function parseGlmQuota(json) {
-  const root = asRecord2(json);
+  const root = asRecord(json);
   if (!root) throw new Error("\u54CD\u5E94\u4E0D\u662F JSON \u5BF9\u8C61");
-  if (root.success === false) throw new Error(strField2(root, "msg") ?? "\u63A5\u53E3\u8FD4\u56DE\u5931\u8D25");
-  const data = asRecord2(root.data) ?? root;
+  if (root.success === false) throw new Error(strField(root, "msg") ?? "\u63A5\u53E3\u8FD4\u56DE\u5931\u8D25");
+  const data = asRecord(root.data) ?? root;
   const windows = glmWindows(data);
   if (!windows.length) throw new Error("\u54CD\u5E94\u4E2D\u65E0 TOKENS_LIMIT/CREDIT_LIMIT \u7A97\u53E3");
-  return { level: strField2(data, "level"), windows, extras: [] };
+  return { level: strField(data, "level"), windows, extras: [] };
 }
 
 // src/providers/glm.ts
@@ -319,7 +411,7 @@ var glmAdapter = {
 // src/parsers/kimi.ts
 function kimiWindowLabel(win) {
   const dur = toNum(win?.duration);
-  const unit = strField2(win, "timeUnit") ?? "";
+  const unit = strField(win, "timeUnit") ?? "";
   if (unit.includes("MINUTE") && dur === 300) return "5h";
   if (dur == null) return "\u7A97\u53E3";
   if (unit.includes("MINUTE")) return `${dur}m`;
@@ -336,7 +428,7 @@ function kimiUsed(detail, limit) {
 }
 function kimiWindows(root) {
   const windows = [];
-  const usage = asRecord2(root.usage);
+  const usage = asRecord(root.usage);
   if (usage) {
     const limit = toNum(usage.limit);
     const used = kimiUsed(usage, limit);
@@ -349,11 +441,11 @@ function kimiWindows(root) {
     });
   }
   for (const item of limitsOf(root)) {
-    const detail = asRecord2(item?.detail) ?? item;
+    const detail = asRecord(item?.detail) ?? item;
     const limit = toNum(detail?.limit);
     const used = kimiUsed(detail, limit);
     windows.push({
-      label: kimiWindowLabel(asRecord2(item?.window)),
+      label: kimiWindowLabel(asRecord(item?.window)),
       usedPct: pctOf(used, limit),
       used,
       limit,
@@ -363,7 +455,7 @@ function kimiWindows(root) {
   return windows;
 }
 function kimiExtras(root) {
-  const cents = toNum(asRecord2(asRecord2(root.boosterWallet)?.monthlyUsed)?.priceInCents);
+  const cents = toNum(asRecord(asRecord(root.boosterWallet)?.monthlyUsed)?.priceInCents);
   if (cents == null) return [];
   return [{ label: "\u6708\u6D88", value: `\xA5${(cents / 100).toFixed(2)}` }];
 }
@@ -372,12 +464,12 @@ function stripLevelPrefix(level) {
   return level.startsWith("LEVEL_") ? level.slice("LEVEL_".length) : level;
 }
 function parseKimiQuota(json) {
-  const root = asRecord2(json);
+  const root = asRecord(json);
   if (!root) throw new Error("\u54CD\u5E94\u4E0D\u662F JSON \u5BF9\u8C61");
   const windows = kimiWindows(root);
   if (!windows.length) throw new Error("\u54CD\u5E94\u4E2D\u65E0 usage/limits \u7A97\u53E3");
   sortByDisplayOrder(windows);
-  const level = strField2(asRecord2(asRecord2(root.user)?.membership), "level");
+  const level = strField(asRecord(asRecord(root.user)?.membership), "level");
   return { level: stripLevelPrefix(level), windows, extras: kimiExtras(root) };
 }
 
@@ -399,7 +491,7 @@ var kimiAdapter = {
 
 // src/parsers/minimax.ts
 function pickEntry(entries) {
-  const byName = (pred) => entries.find((e) => pred(strField2(e, "model_name") ?? ""));
+  const byName = (pred) => entries.find((e) => pred(strField(e, "model_name") ?? ""));
   return byName((n) => /^minimax-m/i.test(n)) ?? byName((n) => n === "general") ?? byName((n) => n === "chat" || n === "text");
 }
 function minmaxWindow(entry, prefix, label) {
@@ -416,20 +508,20 @@ function minmaxWindow(entry, prefix, label) {
   };
 }
 function minmaxLevel(entry) {
-  const name = strField2(entry, "model_name");
+  const name = strField(entry, "model_name");
   if (name == null || !/^minimax-m/i.test(name)) return void 0;
   return name;
 }
 function parseMinimaxQuota(json) {
-  const root = asRecord2(json);
+  const root = asRecord(json);
   if (!root) throw new Error("\u54CD\u5E94\u4E0D\u662F JSON \u5BF9\u8C61");
-  const baseResp = asRecord2(root.base_resp);
+  const baseResp = asRecord(root.base_resp);
   const code = toNum(baseResp?.status_code);
   if (code != null && code !== 0) {
-    throw new Error(strField2(baseResp, "status_msg") ?? `\u63A5\u53E3\u8FD4\u56DE\u5931\u8D25\uFF08status_code=${code}\uFF09`);
+    throw new Error(strField(baseResp, "status_msg") ?? `\u63A5\u53E3\u8FD4\u56DE\u5931\u8D25\uFF08status_code=${code}\uFF09`);
   }
   const raw = root.model_remains;
-  const entries = Array.isArray(raw) ? raw.map(asRecord2).filter((e) => e != null) : [];
+  const entries = Array.isArray(raw) ? raw.map(asRecord).filter((e) => e != null) : [];
   const entry = pickEntry(entries);
   if (!entry) throw new Error("\u54CD\u5E94\u4E2D\u65E0\u53EF\u7528\u989D\u5EA6\u6761\u76EE\uFF08model_remains \u4E3A\u7A7A\u6216 model_name \u4E0D\u53EF\u8BC6\u522B\uFF09");
   const windows = [minmaxWindow(entry, "interval", "5h"), minmaxWindow(entry, "weekly", "\u5468")];
@@ -1262,17 +1354,17 @@ function readOptions(raw) {
   const list = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string") : void 0;
   return { providers: list(raw?.providers), intervalMs: num(raw?.intervalMs), title: str(raw?.title) };
 }
-function asRecord3(v) {
+function asRecord2(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v) ? v : void 0;
 }
 function hostProviders(api) {
   return () => {
     const list = api.state?.provider;
     const fromHost = Array.isArray(list) ? list.map((p) => {
-      const rec = asRecord3(p);
-      const options = asRecord3(rec?.options);
-      const id = rec?.id;
-      const name = rec?.name;
+      const rec2 = asRecord2(p);
+      const options = asRecord2(rec2?.options);
+      const id = rec2?.id;
+      const name = rec2?.name;
       const baseURL = options?.baseURL;
       const apiKey = options?.apiKey;
       return {
@@ -1387,26 +1479,21 @@ function whenRendererReady(api, run) {
 }
 var tui = async (api, options) => {
   try {
-    let activeAdapter2 = function(sessionID2) {
-      const st = api.state;
-      let messages = [];
-      try {
-        const m = sessionID2 ? st?.session?.messages?.(sessionID2) : void 0;
-        if (Array.isArray(m)) messages = m;
-      } catch {
-        messages = [];
-      }
-      const active = resolveActiveProvider({ messages, config: st?.config });
-      const byId = active.providerID ? adapterForProviderId(active.providerID) : void 0;
+    let activeAdapter2 = function() {
       const list = candidates();
-      return byId && list.includes(byId) ? byId : byId ?? list[0];
-    }, scheduleRetry2 = function(sessionID2) {
+      const byId = detectedProviderID ? adapterForProviderId(detectedProviderID) : void 0;
+      if (byId && list.includes(byId)) return byId;
+      if (byId) return byId;
+      return list[0];
+    }, panelTitle2 = function() {
+      return `${activeAdapter2()?.label ?? "\u5957\u9910"} Quota`;
+    }, scheduleRetry2 = function() {
       if (retryCount >= 6) return;
       const delay = Math.min(4e3, 300 * 2 ** retryCount);
       retryCount += 1;
-      setTimeout(() => void load(sessionID2, true), delay);
+      setTimeout(() => void load(true), delay);
     };
-    var activeAdapter = activeAdapter2, scheduleRetry = scheduleRetry2;
+    var activeAdapter = activeAdapter2, panelTitle = panelTitle2, scheduleRetry = scheduleRetry2;
     trace(`setup \u5F00\u59CB renderer=${String(api.renderer?.isRunning)}`);
     trace(`api \u6210\u5458: ${Object.keys(api).join(",")}`);
     trace(
@@ -1428,18 +1515,37 @@ var tui = async (api, options) => {
     const [snapshot, setSnapshot] = createSignal2(null);
     const [title, setTitle] = createSignal2(opts.title ?? "\u5957\u9910\u7528\u91CF");
     const [refreshTick, setRefreshTick] = createSignal2(0);
+    let detectedProviderID;
+    let probeInFlight = false;
+    async function refreshActiveProvider() {
+      if (probeInFlight) return;
+      probeInFlight = true;
+      try {
+        const r = await detectActiveProvider(api);
+        r.notes.forEach((n) => trace(`  \u63A2\u6D4B: ${n}`));
+        if (r.providerID !== detectedProviderID) {
+          trace(`\u6D3B\u8DC3 provider: ${detectedProviderID ?? "(\u65E0)"} \u2192 ${r.providerID ?? "(\u4ECD\u672A\u63A2\u5230)"}`);
+          detectedProviderID = r.providerID;
+        }
+      } catch (e) {
+        trace(`\u63A2\u6D4B\u6D3B\u8DC3 provider \u629B\u5F02\u5E38: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+      } finally {
+        probeInFlight = false;
+      }
+    }
     let lastFetch = 0;
     let inFlight = false;
     let retryCount = 0;
-    async function load(sessionID2, force) {
+    async function load(force) {
       const now = Date.now();
       if (!force && now - lastFetch < intervalMs - 1e3) return;
       if (inFlight) return;
-      const adapter = activeAdapter2(sessionID2);
+      await refreshActiveProvider();
+      const adapter = activeAdapter2();
       if (!adapter) {
         trace(`load\uFF1A\u672A\u627E\u5230\u53EF\u7528 adapter\uFF08\u7B2C ${retryCount} \u6B21\uFF0C\u5C06\u91CD\u8BD5\uFF09`);
         setSnapshot({ provider: "\u2014", ok: false, error: "\u672A\u627E\u5230\u53EF\u7528\u7684\u5957\u9910 provider", fetchedAt: now });
-        scheduleRetry2(sessionID2);
+        scheduleRetry2();
         return;
       }
       retryCount = 0;
@@ -1448,6 +1554,7 @@ var tui = async (api, options) => {
       try {
         const quota = await fetchQuota(adapter, getProviders());
         trace(`load \u6210\u529F provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`);
+        setTitle(panelTitle2());
         setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -1464,14 +1571,14 @@ var tui = async (api, options) => {
     }
     let sessionID;
     const render = (slotProps) => {
-      const props = asRecord3(slotProps);
+      const props = asRecord2(slotProps);
       const next = typeof props?.session_id === "string" ? props.session_id : sessionID;
       if (next !== sessionID) {
         sessionID = next;
-        setTitle(`${activeAdapter2(sessionID)?.label ?? "\u5957\u9910"} \u989D\u5EA6`);
-        void load(sessionID, true);
+        trace(`render \u88AB\u8C03\u7528 session=${next ?? "(none)"}`);
+        setTitle(panelTitle2());
+        void load(true);
       }
-      trace(`render \u88AB\u8C03\u7528 session=${next ?? "(none)"}`);
       return createComponent(QuotaPanel, {
         snapshot,
         title,
@@ -1482,41 +1589,62 @@ var tui = async (api, options) => {
       });
     };
     const stopReady = whenRendererReady(api, () => {
-      const { ok, dispose } = registerSidebarSlot(api, render);
+      const { ok, dispose: dispose2 } = registerSidebarSlot(api, render);
       if (!ok) {
         guard("toast", () => api.ui.toast({ variant: "error", message: "quota-switch: \u672A\u80FD\u6CE8\u518C sidebar \u63D2\u69FD" }));
-      } else if (dispose) {
-        guard("onDispose(dispose)", () => api.lifecycle.onDispose(dispose));
+      } else if (dispose2) {
+        guard("onDispose(dispose)", () => api.lifecycle.onDispose(dispose2));
       }
-      guard("setTitle", () => setTitle(`${activeAdapter2(sessionID)?.label ?? "\u5957\u9910"} \u989D\u5EA6`));
-      void load(sessionID, true);
+      guard("setTitle", () => setTitle(panelTitle2()));
+      void load(true);
     });
     const offRefresh = registerRefreshCommand(api, () => {
       setRefreshTick(Date.now());
-      void load(sessionID, true);
+      void load(true);
     });
     trace(`\u51C6\u5907\u6CE8\u518C\uFF0Ccandidates=${candidates().map((c) => c.id).join(",") || "(\u65E0)"}`);
     trace(`\u51ED\u8BC1\u6765\u6E90 auth.json: ${authFileTrace()}`);
     trace(`\u5408\u5E76\u540E provider \u6761\u76EE: ${getProviders().map((p) => `${p.id}${p.baseURL ? "(\u6709baseURL)" : ""}`).join(",") || "(\u65E0)"}`);
+    const dataNS = asRecord2(asRecord2(api)?.data);
+    const dataOn = dataNS?.on;
     const offs = (guard(
-      "event.on",
-      () => typeof api.event?.on === "function" ? [
-        api.event.on("message.updated", () => void load(sessionID, false)),
-        api.event.on("session.updated", () => void load(sessionID, false)),
-        api.event.on("session.idle", () => void load(sessionID, true))
+      "data.on",
+      () => typeof dataOn === "function" ? [
+        dataOn.call(dataNS, "message.updated", () => void load(false)),
+        dataOn.call(dataNS, "session.updated", () => void load(false)),
+        dataOn.call(dataNS, "session.idle", () => void load(true))
       ] : []
     ) ?? []).filter((off) => typeof off === "function");
-    const timer = setInterval(() => void load(sessionID, false), intervalMs);
-    guard(
-      "lifecycle.onDispose",
-      () => api.lifecycle.onDispose(() => {
-        clearInterval(timer);
-        stopReady();
-        offRefresh();
-        offs.forEach((off) => off());
-      })
-    );
-    trace(`setup \u8D70\u5B8C\uFF0C\u672A\u629B\u5F02\u5E38\uFF08offs=${offs.length} timer=${intervalMs}ms\uFF09`);
+    const timer = setInterval(() => void load(false), intervalMs);
+    const watchTimer = setInterval(() => {
+      void (async () => {
+        const before = detectedProviderID;
+        await refreshActiveProvider();
+        if (detectedProviderID !== before) {
+          setTitle(panelTitle2());
+          void load(true);
+        }
+      })();
+    }, 3e3);
+    const dispose = () => {
+      clearInterval(timer);
+      clearInterval(watchTimer);
+      stopReady();
+      offRefresh();
+      offs.forEach((off) => off());
+    };
+    for (const [obj, path2] of [
+      [api, "api.lifecycle.onDispose"],
+      [asRecord2(api)?.app, "api.app.onDispose"],
+      [asRecord2(api)?.renderer, "api.renderer.onDispose"]
+    ]) {
+      const fn = obj?.onDispose;
+      if (typeof fn === "function") {
+        guard(path2, () => fn.call(obj, dispose));
+        break;
+      }
+    }
+    trace(`setup \u8D70\u5B8C\uFF0C\u672A\u629B\u5F02\u5E38\uFF08offs=${offs.length} timer=${intervalMs}ms watch=3000ms\uFF09`);
   } catch (e) {
     trace(`setup \u629B\u5F02\u5E38\uFF08\u5DF2\u541E\u6389\uFF0C\u4E0D\u5F71\u54CD\u5DF2\u6CE8\u518C\u7684\u69FD\u4F4D\uFF09: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
   }

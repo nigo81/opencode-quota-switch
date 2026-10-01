@@ -8,7 +8,7 @@ import { createSignal } from "solid-js"
 import { createComponent } from "@opentui/solid"
 import fs from "node:fs"
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
-import { resolveActiveProvider } from "./src/active-provider.js"
+import { detectActiveProvider } from "./src/active-provider.js"
 import { authFileProviders, authFileTrace } from "./src/authfile.js"
 import { availableAdapters, adapterForProviderId, fetchQuota } from "./src/providers/index.js"
 import { QuotaPanel } from "./src/ui/index.js"
@@ -239,44 +239,63 @@ const tui: TuiPlugin = async (api, options) => {
   const [title, setTitle] = createSignal(opts.title ?? "套餐用量")
   const [refreshTick, setRefreshTick] = createSignal(0)
 
-  // 活跃 provider：会话内最近一条消息优先，其次配置默认模型
-  // api.state 在 setup 阶段为 undefined，所有访问都走可选链
-  function activeAdapter(sessionID: string | undefined) {
-    const st = (api as { state?: { session?: { messages?: (id: string) => readonly unknown[] }; config?: unknown } })
-      .state
-    let messages: readonly unknown[] = []
+  // ---------------------------------------------------------------- 活跃 provider
+  // v2.0.21 没有 api.state，槽位 render 回调也不传 session_id（trace 实测
+  // `render 被调用 session=(none)`），所以活跃 provider 只能靠探测宿主模型状态。
+  // 探测是异步的，结果缓存在 detectedProviderID 里供同步的 activeAdapter 读。
+  let detectedProviderID: string | undefined
+  let probeInFlight = false
+  async function refreshActiveProvider(): Promise<void> {
+    if (probeInFlight) return
+    probeInFlight = true
     try {
-      const m = sessionID ? st?.session?.messages?.(sessionID) : undefined
-      if (Array.isArray(m)) messages = m
-    } catch {
-      messages = []
+      const r = await detectActiveProvider(api)
+      r.notes.forEach((n) => trace(`  探测: ${n}`))
+      if (r.providerID !== detectedProviderID) {
+        trace(`活跃 provider: ${detectedProviderID ?? "(无)"} → ${r.providerID ?? "(仍未探到)"}`)
+        detectedProviderID = r.providerID
+      }
+    } catch (e) {
+      trace(`探测活跃 provider 抛异常: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
+    } finally {
+      probeInFlight = false
     }
-    const active = resolveActiveProvider({ messages, config: st?.config })
-    const byId = active.providerID ? adapterForProviderId(active.providerID) : undefined
+  }
+
+  function activeAdapter() {
     const list = candidates()
-    // 判定到的 provider 不在候选里（未认证/被白名单排除）→ 回落到首个可用 adapter
-    return byId && list.includes(byId) ? byId : (byId ?? list[0])
+    const byId = detectedProviderID ? adapterForProviderId(detectedProviderID) : undefined
+    if (byId && list.includes(byId)) return byId
+    if (byId) return byId
+    return list[0]
+  }
+
+  /** 面板标题：`${provider} Quota`，与参考实现 opencode-glm-vistatus 的 `GLM Quota v1.5.0` 对齐 */
+  function panelTitle(): string {
+    return `${activeAdapter()?.label ?? "套餐"} Quota`
   }
 
   let lastFetch = 0
   let inFlight = false
   let retryCount = 0
-  /** 宿主填充 api.state 是异步的，首次取数可能扑空，阶梯重试几次 */
-  function scheduleRetry(sessionID: string | undefined): void {
+  /** 探测活跃 provider 是异步的，首次可能扑空，阶梯重试几次 */
+  function scheduleRetry(): void {
     if (retryCount >= 6) return
     const delay = Math.min(4000, 300 * 2 ** retryCount)
     retryCount += 1
-    setTimeout(() => void load(sessionID, true), delay)
+    setTimeout(() => void load(true), delay)
   }
-  async function load(sessionID: string | undefined, force: boolean): Promise<void> {
+  async function load(force: boolean): Promise<void> {
     const now = Date.now()
     if (!force && now - lastFetch < intervalMs - 1000) return
     if (inFlight) return
-    const adapter = activeAdapter(sessionID)
+    // 每轮取数前先重新探测一次活跃 provider：用户切模型/切会话后能自动跟上
+    await refreshActiveProvider()
+    const adapter = activeAdapter()
     if (!adapter) {
       trace(`load：未找到可用 adapter（第 ${retryCount} 次，将重试）`)
       setSnapshot({ provider: "—", ok: false, error: "未找到可用的套餐 provider", fetchedAt: now })
-      scheduleRetry(sessionID)
+      scheduleRetry()
       return
     }
     retryCount = 0
@@ -285,6 +304,7 @@ const tui: TuiPlugin = async (api, options) => {
     try {
       const quota = await fetchQuota(adapter, getProviders())
       trace(`load 成功 provider=${adapter.label} windows=${quota.windows.length} extras=${quota.extras.length}`)
+      setTitle(panelTitle())
       setSnapshot({ provider: adapter.label, ok: true, quota, fetchedAt: now })
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -307,12 +327,12 @@ const tui: TuiPlugin = async (api, options) => {
     const next = typeof props?.session_id === "string" ? props.session_id : sessionID
     if (next !== sessionID) {
       sessionID = next
-      setTitle(`${activeAdapter(sessionID)?.label ?? "套餐"} 额度`)
-      void load(sessionID, true)
+      trace(`render 被调用 session=${next ?? "(none)"}`)
+      setTitle(panelTitle())
+      void load(true)
     }
     // 必须经 createComponent 在宿主的响应式 owner 内实例化。
     // 直接调用 QuotaPanel({...}) 不会建立 owner，组件不渲染（实测踩过）。
-    trace(`render 被调用 session=${next ?? "(none)"}`)
     return createComponent(QuotaPanel, {
       snapshot,
       title,
@@ -330,44 +350,71 @@ const tui: TuiPlugin = async (api, options) => {
     } else if (dispose) {
       guard("onDispose(dispose)", () => api.lifecycle.onDispose(dispose))
     }
-    guard("setTitle", () => setTitle(`${activeAdapter(sessionID)?.label ?? "套餐"} 额度`))
-    void load(sessionID, true)
+    guard("setTitle", () => setTitle(panelTitle()))
+    void load(true)
   })
 
   // /quota-refresh：bump 信号让面板立即重取，同时强制绕过 interval 节流
   const offRefresh = registerRefreshCommand(api, () => {
     setRefreshTick(Date.now())
-    void load(sessionID, true)
+    void load(true)
   })
 
   // 消息更新 = 可能换 provider；空闲 = 一次问答结束，两个都要重新判定。
-  // v2.0.21 实测真实成员里没有 api.event，故整段降级为可选。
+  // v2.0.21 实测没有 api.event，事件总线是 api.data.on（成员 on/listen/session/project/…）。
   trace(`准备注册，candidates=${candidates().map((c) => c.id).join(",") || "(无)"}`)
   trace(`凭证来源 auth.json: ${authFileTrace()}`)
   trace(`合并后 provider 条目: ${getProviders().map((p) => `${p.id}${p.baseURL ? "(有baseURL)" : ""}`).join(",") || "(无)"}`)
+  const dataNS = asRecord(asRecord(api)?.data)
+  const dataOn = dataNS?.on as ((e: string, cb: () => void) => unknown) | undefined
   const offs = (
-    guard("event.on", () =>
-      typeof (api.event as { on?: unknown } | undefined)?.on === "function"
+    guard("data.on", () =>
+      typeof dataOn === "function"
         ? [
-            api.event.on("message.updated", () => void load(sessionID, false)),
-            api.event.on("session.updated", () => void load(sessionID, false)),
-            api.event.on("session.idle", () => void load(sessionID, true)),
+            dataOn.call(dataNS, "message.updated", () => void load(false)),
+            dataOn.call(dataNS, "session.updated", () => void load(false)),
+            dataOn.call(dataNS, "session.idle", () => void load(true)),
           ]
         : [],
     ) ?? []
   ).filter((off): off is () => void => typeof off === "function")
 
-  const timer = setInterval(() => void load(sessionID, false), intervalMs)
+  const timer = setInterval(() => void load(false), intervalMs)
 
-  guard("lifecycle.onDispose", () =>
-    api.lifecycle.onDispose(() => {
-      clearInterval(timer)
-      stopReady()
-      offRefresh()
-      offs.forEach((off) => off())
-    }),
-  )
-  trace(`setup 走完，未抛异常（offs=${offs.length} timer=${intervalMs}ms）`)
+  // 切 provider 的响应要快：每 3s 只探不取，只有探到变化时才重新取数。
+  // 60s 的取数节流保持不变，所以这个轮询几乎不产生额外请求。
+  const watchTimer = setInterval(() => {
+    void (async () => {
+      const before = detectedProviderID
+      await refreshActiveProvider()
+      if (detectedProviderID !== before) {
+        setTitle(panelTitle())
+        void load(true)
+      }
+    })()
+  }, 3000)
+
+  const dispose = (): void => {
+    clearInterval(timer)
+    clearInterval(watchTimer)
+    stopReady()
+    offRefresh()
+    offs.forEach((off) => off())
+  }
+  // v2.0.21 没有 api.lifecycle.onDispose（trace 实测 undefined），试几个可能的挂载点，挂不上就算了：
+  // 泄漏的只是一个 setInterval，插件重载时会被宿主整体换掉。
+  for (const [obj, path] of [
+    [api, "api.lifecycle.onDispose"],
+    [asRecord(api)?.app, "api.app.onDispose"],
+    [asRecord(api)?.renderer, "api.renderer.onDispose"],
+  ] as const) {
+    const fn = (obj as Record<string, unknown> | undefined)?.onDispose
+    if (typeof fn === "function") {
+      guard(path, () => (fn as (cb: () => void) => void).call(obj, dispose))
+      break
+    }
+  }
+  trace(`setup 走完，未抛异常（offs=${offs.length} timer=${intervalMs}ms watch=3000ms）`)
   } catch (e) {
     // 宿主调用 setup 时若抛异常，外层不会打印栈，排障全靠这里。
     // 不再 re-throw：槽位已经注册成功，抛出去反而可能让宿主把整块 UI 拆掉。
