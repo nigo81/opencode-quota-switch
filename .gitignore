@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+
+# 运行时状态：含本地生成的二进制安全密钥（logs/security/.security-key），绝不入库
+logs/
+
+# 上游 opencode-quota-usage 的原始文件，仅供本地对照开发用。
+# 逐字副本涉及第三方 MIT 版权，不随本仓库分发；出处已在 README「参考项目」中标注。
+reference/

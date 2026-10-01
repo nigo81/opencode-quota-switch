@@ -1,0 +1,41 @@
+{
+  "name": "opencode-quota-switch",
+  "version": "0.1.0",
+  "description": "OpenCode TUI plugin — sidebar quota panel that follows the active provider (GLM / MiniMax / Kimi / DeepSeek)",
+  "type": "module",
+  "exports": {
+    "./tui": "./main.ts"
+  },
+  "files": [
+    "main.ts",
+    "src",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "opencode-tui-plugin",
+    "quota",
+    "usage",
+    "zhipu",
+    "glm",
+    "minimax",
+    "kimi",
+    "deepseek"
+  ],
+  "license": "MIT",
+  "engines": {
+    "opencode": ">=1.17.0"
+  },
+  "comment:dependencies": "CRITICAL: keep `dependencies` EMPTY. @opentui/core + solid-js + @opentui/solid must stay host-provided (devDependencies only). Shipping our own copy creates a second render library instance; Solid signal subscriptions cannot bridge to the host render loop and the panel freezes on the first frame (this is why upstream opencode-quota-usage had to drop to imperative rendering — it pinned @opentui/core in dependencies).",
+  "dependencies": {},
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.17.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.15.10",
+    "@opentui/solid": "0.2.15",
+    "solid-js": "1.9.12",
+    "typescript": "^5.8.2"
+  }
+}
