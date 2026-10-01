@@ -59,9 +59,15 @@ function sessionTimeScore(s: Rec): { t: number; by: string } | undefined {
 }
 
 /** 只打 key 名单，不回显值 —— 防把凭证之类的东西写进日志 */
+/** key 名单最多回显 12 个：api.renderer 有几百个成员，全打会把 trace 淹掉 */
+const KEY_LIST_MAX = 12
+
 function keyList(v: unknown): string {
   const r = rec(v)
-  return r ? Object.keys(r).join(",") : typeof v
+  if (!r) return typeof v
+  const keys = Object.keys(r)
+  const head = keys.slice(0, KEY_LIST_MAX).join(",")
+  return keys.length > KEY_LIST_MAX ? `${head} …(+${keys.length - KEY_LIST_MAX})` : head
 }
 
 /**

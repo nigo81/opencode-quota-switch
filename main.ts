@@ -244,6 +244,8 @@ const tui: TuiPlugin = async (api, options) => {
   // `render 被调用 session=(none)`），所以活跃 provider 只能靠探测宿主模型状态。
   // 探测是异步的，结果缓存在 detectedProviderID 里供同步的 activeAdapter 读。
   let detectedProviderID: string | undefined
+  /** 是否曾经成功探测到过活跃 provider。false 时面板显示「探测中…」而不是拿 GLM 冒充 */
+  let hasDetected = false
   let probeInFlight = false
   async function refreshActiveProvider(): Promise<void> {
     if (probeInFlight) return
@@ -265,6 +267,7 @@ const tui: TuiPlugin = async (api, options) => {
       if (r.providerID !== detectedProviderID) {
         trace(`活跃 provider: ${detectedProviderID ?? "(无)"} → ${r.providerID}`)
         detectedProviderID = r.providerID
+        hasDetected = true
       }
     } catch (e) {
       trace(`探测活跃 provider 抛异常: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
@@ -283,6 +286,8 @@ const tui: TuiPlugin = async (api, options) => {
 
   /** 面板标题：`${provider} Quota`，与参考实现 opencode-glm-vistatus 的 `GLM Quota v1.5.0` 对齐 */
   function panelTitle(): string {
+    // 还没探测到活跃 provider 时不写死 GLM 的名字，否则标题先于数据误导
+    if (!hasDetected) return "套餐 Quota"
     return `${activeAdapter()?.label ?? "套餐"} Quota`
   }
 
@@ -302,6 +307,15 @@ const tui: TuiPlugin = async (api, options) => {
     if (inFlight) return
     // 每轮取数前先重新探测一次活跃 provider：用户切模型/切会话后能自动跟上
     await refreshActiveProvider()
+    // 还没探测到过活跃 provider：什么都不取，只显示「探测中…」。
+    // 否则 activeAdapter() 会回落到候选列表首个（GLM），把 GLM 的数据
+    // 冒充成当前 provider 显示——启动头几秒会闪一次 GLM。
+    if (!hasDetected) {
+      trace("load：活跃 provider 尚未探测到，显示探测中")
+      setSnapshot({ provider: "", ok: false, error: "", detecting: true, fetchedAt: now })
+      scheduleRetry()
+      return
+    }
     const adapter = activeAdapter()
     if (!adapter) {
       trace(`load：未找到可用 adapter（第 ${retryCount} 次，将重试）`)

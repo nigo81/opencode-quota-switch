@@ -329,6 +329,9 @@ export function QuotaPanel(props: QuotaPanelProps): JSX.Element {
   const body = (): JSX.Element => {
     const s = snap()
     if (!s) return <Notice icon=">" text="加载中…" fg={pal().muted} />
+    // 活跃 provider 还没探测到：这不是查询失败，是还没开始查。两者必须区分，
+    // 否则启动头几秒会拿候选列表首个（GLM）的额度冒充当前 provider。
+    if (s.detecting) return <Notice icon=">" text="探测当前 provider…" fg={pal().muted} />
     if (!s.ok) return <Notice icon="⚠" text={s.error ?? "查询失败"} fg={pal().error} />
     const q = s.quota
     if (!q) return <Notice icon=">" text="暂无数据" fg={pal().muted} />

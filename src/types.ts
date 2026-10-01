@@ -31,6 +31,12 @@ export type QuotaSnapshot = {
   error?: string
   quota?: ProviderQuota
   fetchedAt: number
+  /**
+   * 活跃 provider 还没探测到，尚未发起任何取数。
+   * 与 ok=false 的「查询失败」区分开：这时展示「探测中…」，
+   * 避免启动头几秒拿候选列表首个（GLM）的数据冒充当前 provider。
+   */
+  detecting?: boolean
 }
 
 /** 宿主 provider 条目的最小形状（运行时逐字段收窄，不信任 SDK 类型） */

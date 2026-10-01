@@ -35,9 +35,13 @@ function sessionTimeScore(s) {
   }
   return void 0;
 }
+var KEY_LIST_MAX = 12;
 function keyList(v) {
   const r = rec(v);
-  return r ? Object.keys(r).join(",") : typeof v;
+  if (!r) return typeof v;
+  const keys = Object.keys(r);
+  const head = keys.slice(0, KEY_LIST_MAX).join(",");
+  return keys.length > KEY_LIST_MAX ? `${head} \u2026(+${keys.length - KEY_LIST_MAX})` : head;
 }
 function pickProviderIDFromModelLike(m, known) {
   if (typeof m === "string") return providerIDFromModelString(m, known);
@@ -1270,6 +1274,13 @@ function QuotaPanel(props) {
         return pal().muted;
       }
     });
+    if (s.detecting) return _$createComponent(Notice, {
+      icon: ">",
+      text: "\u63A2\u6D4B\u5F53\u524D provider\u2026",
+      get fg() {
+        return pal().muted;
+      }
+    });
     if (!s.ok) return _$createComponent(Notice, {
       icon: "\u26A0",
       get text() {
@@ -1568,6 +1579,7 @@ var tui = async (api, options) => {
       if (byId) return byId;
       return list[0];
     }, panelTitle2 = function() {
+      if (!hasDetected) return "\u5957\u9910 Quota";
       return `${activeAdapter2()?.label ?? "\u5957\u9910"} Quota`;
     }, scheduleRetry2 = function() {
       if (retryCount >= 6) return;
@@ -1598,6 +1610,7 @@ var tui = async (api, options) => {
     const [title, setTitle] = createSignal2(opts.title ?? "\u5957\u9910\u7528\u91CF");
     const [refreshTick, setRefreshTick] = createSignal2(0);
     let detectedProviderID;
+    let hasDetected = false;
     let probeInFlight = false;
     async function refreshActiveProvider() {
       if (probeInFlight) return;
@@ -1613,6 +1626,7 @@ var tui = async (api, options) => {
         if (r.providerID !== detectedProviderID) {
           trace(`\u6D3B\u8DC3 provider: ${detectedProviderID ?? "(\u65E0)"} \u2192 ${r.providerID}`);
           detectedProviderID = r.providerID;
+          hasDetected = true;
         }
       } catch (e) {
         trace(`\u63A2\u6D4B\u6D3B\u8DC3 provider \u629B\u5F02\u5E38: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
@@ -1628,6 +1642,12 @@ var tui = async (api, options) => {
       if (!force && now - lastFetch < intervalMs - 1e3) return;
       if (inFlight) return;
       await refreshActiveProvider();
+      if (!hasDetected) {
+        trace("load\uFF1A\u6D3B\u8DC3 provider \u5C1A\u672A\u63A2\u6D4B\u5230\uFF0C\u663E\u793A\u63A2\u6D4B\u4E2D");
+        setSnapshot({ provider: "", ok: false, error: "", detecting: true, fetchedAt: now });
+        scheduleRetry2();
+        return;
+      }
       const adapter = activeAdapter2();
       if (!adapter) {
         trace(`load\uFF1A\u672A\u627E\u5230\u53EF\u7528 adapter\uFF08\u7B2C ${retryCount} \u6B21\uFF0C\u5C06\u91CD\u8BD5\uFF09`);
