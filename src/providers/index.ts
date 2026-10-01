@@ -28,9 +28,6 @@ export { deepseekAdapter, glmAdapter, kimiAdapter, minimaxAdapter }
 /** 面板展示顺序：GLM、MiniMax、Kimi、DeepSeek */
 export const PROVIDERS: readonly ProviderAdapter[] = [glmAdapter, minimaxAdapter, kimiAdapter, deepseekAdapter]
 
-/** 凭证缺失时的兜底站点：这两家在 baseURL 缺失时仍知道打哪个 host，其余两家必须靠 baseURL 定位 */
-const DEFAULT_ORIGIN_OK = new Set(["minimax", "deepseek"])
-
 function nonEmpty(s: string | undefined): boolean {
   return s != null && s.trim() !== ""
 }
@@ -72,11 +69,14 @@ export function fetchQuota(adapter: ProviderAdapter, providers: readonly Provide
   return adapter.fetch(p)
 }
 
-/** 该条目是否已具备可用凭证：apiKey 必填，baseURL 除非该 adapter 有兜底站点否则也必填 */
+/**
+ * 该条目是否已具备可用凭证。
+ * 四家 adapter 现在都带兜底站点（见各自 DEFAULT_* 常量），所以只要有 apiKey 就能定位接口，
+ * baseURL 缺失不再是阻塞——这是 v2.0.21 宿主没有 api.state、只能从 auth.json 取 key 的前提。
+ */
 function usableEntry(adapter: ProviderAdapter, p: ProviderLike | undefined): boolean {
-  if (!p || !nonEmpty(p.apiKey)) return false
-  if (nonEmpty(p.baseURL)) return true
-  return DEFAULT_ORIGIN_OK.has(adapter.id)
+  void adapter
+  return nonEmpty(p?.apiKey)
 }
 
 /** 所有已配置可用凭证的 adapter，按 PROVIDERS 展示顺序 */

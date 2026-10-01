@@ -9,6 +9,7 @@ import { createComponent } from "@opentui/solid"
 import fs from "node:fs"
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { resolveActiveProvider } from "./src/active-provider.js"
+import { authFileProviders, authFileTrace } from "./src/authfile.js"
 import { availableAdapters, adapterForProviderId, fetchQuota } from "./src/providers/index.js"
 import { QuotaPanel } from "./src/ui/index.js"
 import type { ProviderLike, QuotaSnapshot } from "./src/types.js"
@@ -55,31 +56,40 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
 }
 
 /**
- * 宿主 provider 条目 → 最小形状（逐字段收窄，不信任 SDK 类型）。
+ * 合并两个凭证来源：宿主 provider 列表（权威，能拿到 baseURL）+ auth.json 兜底。
  *
- * 必须在调用时惰性读取：v2 宿主调用 setup 时 `api.state` 还是 undefined
- * （实测 TypeError: undefined is not an object (evaluating 'api.state.provider')），
- * 且宿主不打印 setup 内的异常栈，setup 静默中断 → 插件完全无表现。
- * 所以这里只记下 getter，不在 setup 阶段取值。
+ * v2.0.21 实测宿主没有 api.state，`api.state?.provider` 恒为 undefined，第一个来源通常是空的；
+ * auth.json 那条路才是实际生效的。合并时宿主条目优先（同一个 id 保留带 baseURL 的那份），
+ * 因为 baseURL 能区分 coding 端点与 paas 端点，auth.json 只有一把 key。
+ * 必须在调用时惰性读取，且宿主不打印 setup 内的异常栈，所以只记 getter 不在 setup 阶段取值。
  */
 function hostProviders(api: TuiPluginApi): () => ProviderLike[] {
   return () => {
     const list = (api as { state?: { provider?: readonly unknown[] } }).state?.provider
-    if (!Array.isArray(list)) return []
-    return list.map((p: unknown): ProviderLike => {
-      const rec = asRecord(p)
-      const options = asRecord(rec?.options)
-      const id = rec?.id
-      const name = rec?.name
-      const baseURL = options?.baseURL
-      const apiKey = options?.apiKey
-      return {
-        id: typeof id === "string" ? id : undefined,
-        name: typeof name === "string" ? name : undefined,
-        baseURL: typeof baseURL === "string" ? baseURL : undefined,
-        apiKey: typeof apiKey === "string" ? apiKey : undefined,
-      }
-    })
+    const fromHost: ProviderLike[] = Array.isArray(list)
+      ? list.map((p: unknown): ProviderLike => {
+          const rec = asRecord(p)
+          const options = asRecord(rec?.options)
+          const id = rec?.id
+          const name = rec?.name
+          const baseURL = options?.baseURL
+          const apiKey = options?.apiKey
+          return {
+            id: typeof id === "string" ? id : undefined,
+            name: typeof name === "string" ? name : undefined,
+            baseURL: typeof baseURL === "string" ? baseURL : undefined,
+            apiKey: typeof apiKey === "string" ? apiKey : undefined,
+          }
+        })
+      : []
+
+    const merged: ProviderLike[] = [...fromHost]
+    for (const entry of authFileProviders()) {
+      const existing = merged.find((p) => p.id === entry.id)
+      if (!existing) merged.push(entry)
+      else if (!existing.apiKey) existing.apiKey = entry.apiKey
+    }
+    return merged
   }
 }
 
@@ -129,34 +139,47 @@ function registerSidebarSlot(
 function registerRefreshCommand(api: TuiPluginApi, refresh: () => void): () => void {
   const layer = (api.keymap as { layer?: (fn: () => unknown) => unknown }).layer
   if (typeof layer === "function") {
-    const off = layer.call(api.keymap, () => ({
-      mode: "global",
-      commands: [
-        {
-          id: "quota-switch.refresh",
-          title: "Quota: 立即刷新",
-          description: "立即重新拉取当前 provider 的套餐用量",
-          group: "Quota",
-          palette: true,
-          slash: { name: "quota-refresh" },
-          run: refresh,
-        },
-      ],
-    }))
-    return typeof off === "function" ? (off as () => void) : () => {}
+    // 实测 v2.0.21 走这条会抛 `Keymap.Provider is missing`（setup 阶段 keymap provider
+    // 尚未就绪）。命令只是锦上添花，抛了就静默降级，不能让它中断 setup 主体。
+    try {
+      const off = layer.call(api.keymap, () => ({
+        mode: "global",
+        commands: [
+          {
+            id: "quota-switch.refresh",
+            title: "Quota: 立即刷新",
+            description: "立即重新拉取当前 provider 的套餐用量",
+            group: "Quota",
+            palette: true,
+            slash: { name: "quota-refresh" },
+            run: refresh,
+          },
+        ],
+      }))
+      trace("命令注册成功：/quota-refresh")
+      return typeof off === "function" ? (off as () => void) : () => {}
+    } catch (e) {
+      trace(`keymap.layer 抛异常，降级（不影响自动刷新）: ${e instanceof Error ? e.message : String(e)}`)
+      return () => {}
+    }
   }
   const register = api.command?.register
   if (typeof register !== "function") return () => {}
-  return register.call(api.command, () => [
-    {
-      title: "立即刷新套餐用量",
-      value: "quota-refresh",
-      description: "立即重新拉取当前 provider 的套餐用量",
-      category: "Quota",
-      slash: { name: "quota-refresh" },
-      onSelect: refresh,
-    },
-  ])
+  try {
+    return register.call(api.command, () => [
+      {
+        title: "立即刷新套餐用量",
+        value: "quota-refresh",
+        description: "立即重新拉取当前 provider 的套餐用量",
+        category: "Quota",
+        slash: { name: "quota-refresh" },
+        onSelect: refresh,
+      },
+    ])
+  } catch (e) {
+    trace(`command.register 抛异常，降级: ${e instanceof Error ? e.message : String(e)}`)
+    return () => {}
+  }
 }
 
 /** 渲染器未就绪时上游会漏注册，轮询到就绪为止，1.5s 兜底（沿用上游实测做法） */
@@ -192,6 +215,16 @@ const tui: TuiPlugin = async (api, options) => {
     `api 子成员: ui=[${Object.keys((api.ui ?? {}) as Record<string, unknown>).join(",")}] ` +
       `slots=[${Object.keys((api.slots ?? {}) as Record<string, unknown>).join(",")}]`,
   )
+  // 逐个探测未知成员的形状：真实运行时与 1.15.10 类型声明不一致，只能实测
+  for (const key of ["data", "options", "keymap", "client", "storage", "model"] as const) {
+    const v = (api as unknown as Record<string, unknown>)[key]
+    const kind = v === null ? "null" : Array.isArray(v) ? `array(${v.length})` : typeof v
+    const sub =
+      v !== null && typeof v === "object"
+        ? `[${Object.keys(v as Record<string, unknown>).slice(0, 20).join(",")}]`
+        : ""
+    trace(`  api.${key} = ${kind}${sub}`)
+  }
   const opts = readOptions(options as Record<string, unknown> | undefined)
   const intervalMs = Math.max(15_000, opts.intervalMs ?? 60_000)
   // 惰性读取：setup 阶段 api.state 还是 undefined，不能在这里取值
@@ -293,11 +326,11 @@ const tui: TuiPlugin = async (api, options) => {
   const stopReady = whenRendererReady(api, () => {
     const { ok, dispose } = registerSidebarSlot(api, render)
     if (!ok) {
-      api.ui.toast({ variant: "error", message: "quota-switch: 未能注册 sidebar 插槽" })
+      guard("toast", () => api.ui.toast({ variant: "error", message: "quota-switch: 未能注册 sidebar 插槽" }))
     } else if (dispose) {
-      api.lifecycle.onDispose(dispose)
+      guard("onDispose(dispose)", () => api.lifecycle.onDispose(dispose))
     }
-    setTitle(`${activeAdapter(sessionID)?.label ?? "套餐"} 额度`)
+    guard("setTitle", () => setTitle(`${activeAdapter(sessionID)?.label ?? "套餐"} 额度`))
     void load(sessionID, true)
   })
 
@@ -307,28 +340,49 @@ const tui: TuiPlugin = async (api, options) => {
     void load(sessionID, true)
   })
 
-  // 消息更新 = 可能换 provider；空闲 = 一次问答结束，两个都要重新判定
+  // 消息更新 = 可能换 provider；空闲 = 一次问答结束，两个都要重新判定。
+  // v2.0.21 实测真实成员里没有 api.event，故整段降级为可选。
   trace(`准备注册，candidates=${candidates().map((c) => c.id).join(",") || "(无)"}`)
-  const offs = [
-    api.event.on("message.updated", () => void load(sessionID, false)),
-    api.event.on("session.updated", () => void load(sessionID, false)),
-    api.event.on("session.idle", () => void load(sessionID, true)),
-  ].filter((off): off is () => void => typeof off === "function")
+  trace(`凭证来源 auth.json: ${authFileTrace()}`)
+  trace(`合并后 provider 条目: ${getProviders().map((p) => `${p.id}${p.baseURL ? "(有baseURL)" : ""}`).join(",") || "(无)"}`)
+  const offs = (
+    guard("event.on", () =>
+      typeof (api.event as { on?: unknown } | undefined)?.on === "function"
+        ? [
+            api.event.on("message.updated", () => void load(sessionID, false)),
+            api.event.on("session.updated", () => void load(sessionID, false)),
+            api.event.on("session.idle", () => void load(sessionID, true)),
+          ]
+        : [],
+    ) ?? []
+  ).filter((off): off is () => void => typeof off === "function")
 
   const timer = setInterval(() => void load(sessionID, false), intervalMs)
 
-  api.lifecycle.onDispose(() => {
-    clearInterval(timer)
-    stopReady()
-    offRefresh()
-    offs.forEach((off) => off())
-  })
-  trace("setup 走完，未抛异常")
- } catch (e) {
-  // 宿主调用 setup 时若抛异常，外层不会打印栈，排障全靠这里
-  trace(`setup 抛异常: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
-  throw e
- }
+  guard("lifecycle.onDispose", () =>
+    api.lifecycle.onDispose(() => {
+      clearInterval(timer)
+      stopReady()
+      offRefresh()
+      offs.forEach((off) => off())
+    }),
+  )
+  trace(`setup 走完，未抛异常（offs=${offs.length} timer=${intervalMs}ms）`)
+  } catch (e) {
+    // 宿主调用 setup 时若抛异常，外层不会打印栈，排障全靠这里。
+    // 不再 re-throw：槽位已经注册成功，抛出去反而可能让宿主把整块 UI 拆掉。
+    trace(`setup 抛异常（已吞掉，不影响已注册的槽位）: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
+  }
+}
+
+/** setup 内任何一步失败都只记录、不中断——面板本体才是主线，附属能力一律降级 */
+function guard<T>(label: string, fn: () => T): T | undefined {
+  try {
+    return fn()
+  } catch (e) {
+    trace(`${label} 抛异常，已跳过: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`)
+    return undefined
+  }
 }
 
 /**

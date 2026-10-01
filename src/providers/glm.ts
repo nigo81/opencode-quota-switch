@@ -12,9 +12,13 @@ const isGlm = (p: ProviderLike): boolean =>
 // 用户配置里同时存在 coding 端点与 paas 端点的智谱 provider，套餐额度必须用 coding 那个的 key
 const isGlmCoding = (p: ProviderLike): boolean => (p.baseURL ?? "").includes("/coding/")
 
+// 兜底站点：v2.0.21 宿主不暴露 api.state，从 auth.json 取凭证时拿不到 baseURL
+const GLM_DEFAULT_ORIGIN = "https://open.bigmodel.cn"
+
 async function fetchGlm(p: ProviderLike): Promise<ProviderQuota> {
-  if (!p.apiKey || !p.baseURL) throw new Error("GLM provider 缺少 apiKey/baseURL")
-  const json = await getJson(`${hostOf(p.baseURL)}/api/monitor/usage/quota/limit`, {
+  if (!p.apiKey) throw new Error("GLM provider 缺少 apiKey")
+  const origin = p.baseURL ? hostOf(p.baseURL) : GLM_DEFAULT_ORIGIN
+  const json = await getJson(`${origin}/api/monitor/usage/quota/limit`, {
     Authorization: p.apiKey, // 实测：智谱监控接口为裸 key，不带 Bearer 前缀
     "Content-Type": "application/json",
     "Accept-Language": "en-US,en",

@@ -1,7 +1,7 @@
 // main.ts
 import { createSignal as createSignal2 } from "solid-js";
 import { createComponent } from "@opentui/solid";
-import fs from "node:fs";
+import fs2 from "node:fs";
 
 // src/active-provider.ts
 function asRecord(v) {
@@ -45,6 +45,56 @@ function resolveActiveProvider(input) {
   const fromConfig = providerIdFromConfig(input.config);
   if (fromConfig) return { providerID: fromConfig, source: "config" };
   return { providerID: void 0, source: "none" };
+}
+
+// src/authfile.ts
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+function candidatePaths() {
+  const paths = [
+    path.join(os.homedir(), ".local", "share", "opencode", "auth.json"),
+    path.join(os.homedir(), ".config", "opencode", "auth.json")
+  ];
+  const xdg = process.env.XDG_DATA_HOME;
+  if (xdg) paths.push(path.join(xdg, "opencode", "auth.json"));
+  return paths;
+}
+var cache = null;
+var TTL_MS = 3e4;
+function readAuthFile() {
+  const now = Date.now();
+  if (cache && now - cache.at < TTL_MS) return cache;
+  let result = { list: [], from: "(\u672A\u627E\u5230 auth.json)" };
+  for (const p of candidatePaths()) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const list = [];
+      for (const [id, value] of Object.entries(raw)) {
+        const entry = value;
+        if (entry === null || typeof entry !== "object") continue;
+        if (entry.type !== void 0 && entry.type !== "api") continue;
+        if (typeof entry.key !== "string" || entry.key.trim() === "") continue;
+        list.push({ id, apiKey: entry.key });
+      }
+      if (list.length > 0) {
+        result = { list, from: p };
+        break;
+      }
+    } catch {
+    }
+  }
+  cache = { at: now, ...result };
+  return result;
+}
+function authFileProviders() {
+  return readAuthFile().list;
+}
+function authFileTrace() {
+  const { list, from } = readAuthFile();
+  return `${from} \u2192 [${list.map((p) => p.id).join(",") || "(\u7A7A)"}]`;
 }
 
 // src/http.ts
@@ -246,9 +296,11 @@ function parseGlmQuota(json) {
 // src/providers/glm.ts
 var isGlm = (p) => matchesAny(p.baseURL ?? "", ["open.bigmodel.cn", "api.z.ai"]) || matchesAny(`${p.id ?? ""} ${p.name ?? ""}`, ["zhipu", "bigmodel", "z.ai"]);
 var isGlmCoding = (p) => (p.baseURL ?? "").includes("/coding/");
+var GLM_DEFAULT_ORIGIN = "https://open.bigmodel.cn";
 async function fetchGlm(p) {
-  if (!p.apiKey || !p.baseURL) throw new Error("GLM provider \u7F3A\u5C11 apiKey/baseURL");
-  const json = await getJson(`${hostOf(p.baseURL)}/api/monitor/usage/quota/limit`, {
+  if (!p.apiKey) throw new Error("GLM provider \u7F3A\u5C11 apiKey");
+  const origin = p.baseURL ? hostOf(p.baseURL) : GLM_DEFAULT_ORIGIN;
+  const json = await getJson(`${origin}/api/monitor/usage/quota/limit`, {
     Authorization: p.apiKey,
     // 实测：智谱监控接口为裸 key，不带 Bearer 前缀
     "Content-Type": "application/json",
@@ -330,10 +382,11 @@ function parseKimiQuota(json) {
 }
 
 // src/providers/kimi.ts
-var isKimi = (p) => matchesAny(p.baseURL ?? "", ["api.kimi.com/coding"]) || p.id === "kimi";
+var isKimi = (p) => matchesAny(p.baseURL ?? "", ["api.kimi.com/coding"]) || matchesAny(`${p.id ?? ""} ${p.name ?? ""}`, ["kimi-for-coding", "kimi", "moonshot"]);
+var KIMI_DEFAULT_BASE = "https://api.kimi.com/coding/v1";
 async function fetchKimi(p) {
-  if (!p.apiKey || !p.baseURL) throw new Error("Kimi provider \u7F3A\u5C11 apiKey/baseURL");
-  const base = trimSlashes(p.baseURL);
+  if (!p.apiKey) throw new Error("Kimi provider \u7F3A\u5C11 apiKey");
+  const base = p.baseURL ? trimSlashes(p.baseURL) : KIMI_DEFAULT_BASE;
   const json = await getJson(`${base}/usages`, { Authorization: `Bearer ${p.apiKey}`, Accept: "application/json" });
   return parseKimiQuota(json);
 }
@@ -406,7 +459,6 @@ var minimaxAdapter = {
 
 // src/providers/index.ts
 var PROVIDERS = [glmAdapter, minimaxAdapter, kimiAdapter, deepseekAdapter];
-var DEFAULT_ORIGIN_OK = /* @__PURE__ */ new Set(["minimax", "deepseek"]);
 function nonEmpty(s) {
   return s != null && s.trim() !== "";
 }
@@ -419,9 +471,8 @@ function fetchQuota(adapter, providers) {
   return adapter.fetch(p);
 }
 function usableEntry(adapter, p) {
-  if (!p || !nonEmpty(p.apiKey)) return false;
-  if (nonEmpty(p.baseURL)) return true;
-  return DEFAULT_ORIGIN_OK.has(adapter.id);
+  void adapter;
+  return nonEmpty(p?.apiKey);
 }
 function availableAdapters(providers) {
   return PROVIDERS.filter((a) => usableEntry(a, pickProvider(providers, a.match, a.prefer)));
@@ -1199,7 +1250,7 @@ var PLUGIN_VERSION = "0.1.0";
 var TRACE_FILE = "/tmp/opencode-quota-switch.log";
 function trace(msg) {
   try {
-    fs.appendFileSync(TRACE_FILE, `[${(/* @__PURE__ */ new Date()).toISOString()}] ${msg}
+    fs2.appendFileSync(TRACE_FILE, `[${(/* @__PURE__ */ new Date()).toISOString()}] ${msg}
 `);
   } catch {
   }
@@ -1217,8 +1268,7 @@ function asRecord3(v) {
 function hostProviders(api) {
   return () => {
     const list = api.state?.provider;
-    if (!Array.isArray(list)) return [];
-    return list.map((p) => {
+    const fromHost = Array.isArray(list) ? list.map((p) => {
       const rec = asRecord3(p);
       const options = asRecord3(rec?.options);
       const id = rec?.id;
@@ -1231,7 +1281,14 @@ function hostProviders(api) {
         baseURL: typeof baseURL === "string" ? baseURL : void 0,
         apiKey: typeof apiKey === "string" ? apiKey : void 0
       };
-    });
+    }) : [];
+    const merged = [...fromHost];
+    for (const entry of authFileProviders()) {
+      const existing = merged.find((p) => p.id === entry.id);
+      if (!existing) merged.push(entry);
+      else if (!existing.apiKey) existing.apiKey = entry.apiKey;
+    }
+    return merged;
   };
 }
 function registerSidebarSlot(api, render) {
@@ -1262,36 +1319,49 @@ function registerSidebarSlot(api, render) {
 function registerRefreshCommand(api, refresh) {
   const layer = api.keymap.layer;
   if (typeof layer === "function") {
-    const off = layer.call(api.keymap, () => ({
-      mode: "global",
-      commands: [
-        {
-          id: "quota-switch.refresh",
-          title: "Quota: \u7ACB\u5373\u5237\u65B0",
-          description: "\u7ACB\u5373\u91CD\u65B0\u62C9\u53D6\u5F53\u524D provider \u7684\u5957\u9910\u7528\u91CF",
-          group: "Quota",
-          palette: true,
-          slash: { name: "quota-refresh" },
-          run: refresh
-        }
-      ]
-    }));
-    return typeof off === "function" ? off : () => {
-    };
+    try {
+      const off = layer.call(api.keymap, () => ({
+        mode: "global",
+        commands: [
+          {
+            id: "quota-switch.refresh",
+            title: "Quota: \u7ACB\u5373\u5237\u65B0",
+            description: "\u7ACB\u5373\u91CD\u65B0\u62C9\u53D6\u5F53\u524D provider \u7684\u5957\u9910\u7528\u91CF",
+            group: "Quota",
+            palette: true,
+            slash: { name: "quota-refresh" },
+            run: refresh
+          }
+        ]
+      }));
+      trace("\u547D\u4EE4\u6CE8\u518C\u6210\u529F\uFF1A/quota-refresh");
+      return typeof off === "function" ? off : () => {
+      };
+    } catch (e) {
+      trace(`keymap.layer \u629B\u5F02\u5E38\uFF0C\u964D\u7EA7\uFF08\u4E0D\u5F71\u54CD\u81EA\u52A8\u5237\u65B0\uFF09: ${e instanceof Error ? e.message : String(e)}`);
+      return () => {
+      };
+    }
   }
   const register = api.command?.register;
   if (typeof register !== "function") return () => {
   };
-  return register.call(api.command, () => [
-    {
-      title: "\u7ACB\u5373\u5237\u65B0\u5957\u9910\u7528\u91CF",
-      value: "quota-refresh",
-      description: "\u7ACB\u5373\u91CD\u65B0\u62C9\u53D6\u5F53\u524D provider \u7684\u5957\u9910\u7528\u91CF",
-      category: "Quota",
-      slash: { name: "quota-refresh" },
-      onSelect: refresh
-    }
-  ]);
+  try {
+    return register.call(api.command, () => [
+      {
+        title: "\u7ACB\u5373\u5237\u65B0\u5957\u9910\u7528\u91CF",
+        value: "quota-refresh",
+        description: "\u7ACB\u5373\u91CD\u65B0\u62C9\u53D6\u5F53\u524D provider \u7684\u5957\u9910\u7528\u91CF",
+        category: "Quota",
+        slash: { name: "quota-refresh" },
+        onSelect: refresh
+      }
+    ]);
+  } catch (e) {
+    trace(`command.register \u629B\u5F02\u5E38\uFF0C\u964D\u7EA7: ${e instanceof Error ? e.message : String(e)}`);
+    return () => {
+    };
+  }
 }
 function whenRendererReady(api, run) {
   if (api.renderer?.isRunning) {
@@ -1342,6 +1412,12 @@ var tui = async (api, options) => {
     trace(
       `api \u5B50\u6210\u5458: ui=[${Object.keys(api.ui ?? {}).join(",")}] slots=[${Object.keys(api.slots ?? {}).join(",")}]`
     );
+    for (const key of ["data", "options", "keymap", "client", "storage", "model"]) {
+      const v = api[key];
+      const kind = v === null ? "null" : Array.isArray(v) ? `array(${v.length})` : typeof v;
+      const sub = v !== null && typeof v === "object" ? `[${Object.keys(v).slice(0, 20).join(",")}]` : "";
+      trace(`  api.${key} = ${kind}${sub}`);
+    }
     const opts = readOptions(options);
     const intervalMs = Math.max(15e3, opts.intervalMs ?? 6e4);
     const getProviders = hostProviders(api);
@@ -1408,11 +1484,11 @@ var tui = async (api, options) => {
     const stopReady = whenRendererReady(api, () => {
       const { ok, dispose } = registerSidebarSlot(api, render);
       if (!ok) {
-        api.ui.toast({ variant: "error", message: "quota-switch: \u672A\u80FD\u6CE8\u518C sidebar \u63D2\u69FD" });
+        guard("toast", () => api.ui.toast({ variant: "error", message: "quota-switch: \u672A\u80FD\u6CE8\u518C sidebar \u63D2\u69FD" }));
       } else if (dispose) {
-        api.lifecycle.onDispose(dispose);
+        guard("onDispose(dispose)", () => api.lifecycle.onDispose(dispose));
       }
-      setTitle(`${activeAdapter2(sessionID)?.label ?? "\u5957\u9910"} \u989D\u5EA6`);
+      guard("setTitle", () => setTitle(`${activeAdapter2(sessionID)?.label ?? "\u5957\u9910"} \u989D\u5EA6`));
       void load(sessionID, true);
     });
     const offRefresh = registerRefreshCommand(api, () => {
@@ -1420,24 +1496,39 @@ var tui = async (api, options) => {
       void load(sessionID, true);
     });
     trace(`\u51C6\u5907\u6CE8\u518C\uFF0Ccandidates=${candidates().map((c) => c.id).join(",") || "(\u65E0)"}`);
-    const offs = [
-      api.event.on("message.updated", () => void load(sessionID, false)),
-      api.event.on("session.updated", () => void load(sessionID, false)),
-      api.event.on("session.idle", () => void load(sessionID, true))
-    ].filter((off) => typeof off === "function");
+    trace(`\u51ED\u8BC1\u6765\u6E90 auth.json: ${authFileTrace()}`);
+    trace(`\u5408\u5E76\u540E provider \u6761\u76EE: ${getProviders().map((p) => `${p.id}${p.baseURL ? "(\u6709baseURL)" : ""}`).join(",") || "(\u65E0)"}`);
+    const offs = (guard(
+      "event.on",
+      () => typeof api.event?.on === "function" ? [
+        api.event.on("message.updated", () => void load(sessionID, false)),
+        api.event.on("session.updated", () => void load(sessionID, false)),
+        api.event.on("session.idle", () => void load(sessionID, true))
+      ] : []
+    ) ?? []).filter((off) => typeof off === "function");
     const timer = setInterval(() => void load(sessionID, false), intervalMs);
-    api.lifecycle.onDispose(() => {
-      clearInterval(timer);
-      stopReady();
-      offRefresh();
-      offs.forEach((off) => off());
-    });
-    trace("setup \u8D70\u5B8C\uFF0C\u672A\u629B\u5F02\u5E38");
+    guard(
+      "lifecycle.onDispose",
+      () => api.lifecycle.onDispose(() => {
+        clearInterval(timer);
+        stopReady();
+        offRefresh();
+        offs.forEach((off) => off());
+      })
+    );
+    trace(`setup \u8D70\u5B8C\uFF0C\u672A\u629B\u5F02\u5E38\uFF08offs=${offs.length} timer=${intervalMs}ms\uFF09`);
   } catch (e) {
-    trace(`setup \u629B\u5F02\u5E38: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
-    throw e;
+    trace(`setup \u629B\u5F02\u5E38\uFF08\u5DF2\u541E\u6389\uFF0C\u4E0D\u5F71\u54CD\u5DF2\u6CE8\u518C\u7684\u69FD\u4F4D\uFF09: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
   }
 };
+function guard(label, fn) {
+  try {
+    return fn();
+  } catch (e) {
+    trace(`${label} \u629B\u5F02\u5E38\uFF0C\u5DF2\u8DF3\u8FC7: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+    return void 0;
+  }
+}
 var main_default = { id: "quota-switch", tui, setup: tui };
 export {
   main_default as default
