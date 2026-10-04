@@ -1501,6 +1501,52 @@ function QuotaPanel(props) {
   }
 }
 
+// src/kv-adapter.ts
+function isTuiKV(v) {
+  if (v === null || typeof v !== "object") return false;
+  const r = v;
+  return typeof r.get === "function" && typeof r.set === "function";
+}
+function asStorageFn(v) {
+  return typeof v === "function" ? v : void 0;
+}
+function memoryKV() {
+  const m = /* @__PURE__ */ new Map();
+  return {
+    get: (key, fallback) => m.has(key) ? m.get(key) : fallback,
+    set: (key, value) => {
+      m.set(key, value);
+    },
+    ready: true
+  };
+}
+function resolveKV(api) {
+  const r = api ?? {};
+  if (isTuiKV(r.kv)) return r.kv;
+  const storage = r.storage ?? {};
+  const backend = asStorageFn(storage.store) ?? asStorageFn(storage.memory);
+  if (backend) {
+    return {
+      get: (key, fallback) => {
+        try {
+          const v = backend(key);
+          return v === void 0 ? fallback : v;
+        } catch {
+          return fallback;
+        }
+      },
+      set: (key, value) => {
+        try {
+          backend(key, value);
+        } catch {
+        }
+      },
+      ready: true
+    };
+  }
+  return memoryKV();
+}
+
 // main.ts
 var PLUGIN_VERSION = "0.1.0";
 var TRACE_ENABLED = process.env.OPENCODE_QUOTA_SWITCH_TRACE !== void 0 && process.env.OPENCODE_QUOTA_SWITCH_TRACE !== "";
@@ -1804,23 +1850,23 @@ var tui = async (api, options) => {
       }
     }
     let sessionID;
-    let panel;
+    const kv = resolveKV(api);
     let renderCount = 0;
     const render = (slotProps) => {
       renderCount += 1;
       const props = asRecord2(slotProps);
-      const next = typeof props?.session_id === "string" ? props.session_id : sessionID;
-      trace(`render #${renderCount} session=${next ?? "(none)"}${panel === void 0 ? "\uFF08\u521B\u5EFA\u9762\u677F\u5B9E\u4F8B\uFF09" : "\uFF08\u590D\u7528\u5B9E\u4F8B\uFF09"}`);
+      const next = typeof props?.sessionID === "string" ? props.sessionID : typeof props?.session_id === "string" ? props.session_id : sessionID;
+      trace(`render #${renderCount} session=${next ?? "(none)"}`);
       if (next !== sessionID) {
         sessionID = next;
         setTitle(panelTitle2());
         void load(true);
       }
-      return panel ??= createComponent(QuotaPanel, {
+      return createComponent(QuotaPanel, {
         snapshot,
         title,
         theme: api.theme,
-        kv: api.kv,
+        kv,
         version: PLUGIN_VERSION
       });
     };

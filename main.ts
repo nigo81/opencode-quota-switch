@@ -14,6 +14,7 @@ import { detectActiveProvider } from "./src/active-provider.js"
 import { authFileProviders, authFileTrace } from "./src/authfile.js"
 import { availableAdapters, adapterForProviderId, fetchQuota } from "./src/providers/index.js"
 import { QuotaPanel } from "./src/ui/index.js"
+import { resolveKV } from "./src/kv-adapter.js"
 import type { ProviderLike, QuotaSnapshot } from "./src/types.js"
 
 /** 面板头部显示的版本号，与 package.json 保持一致 */
@@ -195,8 +196,11 @@ function registerSidebarSlot(
 function registerRefreshCommand(api: TuiPluginApi, refresh: () => void): () => void {
   const layer = (api.keymap as { layer?: (fn: () => unknown) => unknown }).layer
   if (typeof layer === "function") {
-    // 实测 v2.0.21 走这条会抛 `Keymap.Provider is missing`（setup 阶段 keymap provider
-    // 尚未就绪）。命令只是锦上添花，抛了就静默降级，不能让它中断 setup 主体。
+    // 实测 v2.0.22 keymap provider 从插件的响应式 owner **永远够不到**：setup 阶段抛
+    // `Keymap.Provider is missing`，8s 后直调同样抛，塞进全新 createRoot 里也抛——
+    // Solid 的 context 是按 owner 链向上找的，插件闭包里没有 Keymap 祖先，重试/重建
+    // owner 都无解（重试机制试过并已撤）。/quota-refresh 在 2.0.22 上因此注册不上，
+    // 60s 自动刷新是唯一刷新路径。命令只在旧宿主上生效，失败静默降级。
     try {
       const off = layer.call(api.keymap, () => ({
         mode: "global",
@@ -295,8 +299,8 @@ const tui: TuiPlugin = async (api, options) => {
   const [title, setTitle] = createSignal(opts.title ?? "套餐用量")
 
   // ---------------------------------------------------------------- 活跃 provider
-  // v2.0.21 没有 api.state，槽位 render 回调也不传 session_id（trace 实测
-  // `render 被调用 session=(none)`），所以活跃 provider 只能靠探测宿主模型状态。
+  // v2.0.21 没有 api.state，且当时槽位 render 回调读不到 session（2.0.22 实测传
+  // camelCase sessionID，render 里已适配），所以活跃 provider 仍主要靠探测宿主模型状态。
   // 探测是异步的，结果缓存在 detectedProviderID 里供同步的 activeAdapter 读。
   let detectedProviderID: string | undefined
   /** 是否曾经成功探测到过活跃 provider。false 时面板显示「探测中…」而不是拿 GLM 冒充 */
@@ -455,44 +459,42 @@ const tui: TuiPlugin = async (api, options) => {
     }
   }
 
-  // 槽位 props 里的 session_id 决定「当前 provider」，由宿主在切换会话时重新调用
+  // 槽位 props 里的 sessionID 决定「当前 provider」，由宿主在切换会话时重新调用
   let sessionID: string | undefined
-  /**
-   * 面板实例缓存。宿主每注册/重挂一次侧栏就可能再调一次 render，
-   * 而 render 里 `createComponent(QuotaPanel, …)` 每调一次就造一个**全新实例**：
-   * 每个实例自带 1s setInterval（panel.tsx 的 tickTimer）、kv 冷启轮询
-   * （restoreConfig 那条 10ms 轮询）和一整排 createEffect/createMemo，
-   * 宿主多调一次渲染这些就整体翻倍（panel.tsx 里「目标 r.notes≈60」就是按
-   * 单实例估的）。参考实现 opencode-glm-vistatus 也是显式
-   * `if (!card) card = new QuotaCard(...)`。
-   * props 里传的一直是 signal 函数本身（snapshot/title），所以缓存下来的
-   * 实例读到的仍然是最新值，缓存不影响数据刷新。
-   */
-  let panel: unknown
+  const kv = resolveKV(api)
   let renderCount = 0
   const render = (slotProps?: unknown): unknown => {
     renderCount += 1
     const props = asRecord(slotProps)
-    const next = typeof props?.session_id === "string" ? props.session_id : sessionID
-    // 每次 render 都打一行带计数的 trace：之前只在 session_id 变化时打，
-    // 宿主到底调了几次 render 从日志里根本看不出来，所以「多实例」一直没被发现。
-    // trace 现在默认关闭（要 export OPENCODE_QUOTA_SWITCH_TRACE），刷屏无所谓。
-    trace(`render #${renderCount} session=${next ?? "(none)"}${panel === undefined ? "（创建面板实例）" : "（复用实例）"}`)
+    // 宿主 2.0.22 实测传的是 camelCase `sessionID`；snake_case `session_id` 留作旧版兜底。
+    // 之前只读 session_id，恒为 undefined，next 永远回落到旧值，「切会话→重载」分支从不触发。
+    const next =
+      typeof props?.sessionID === "string"
+        ? props.sessionID
+        : typeof props?.session_id === "string"
+          ? props.session_id
+          : sessionID
+    // 每次 render 都打一行带计数的 trace：宿主到底调了几次 render，日志要能对上。
+    trace(`render #${renderCount} session=${next ?? "(none)"}`)
     if (next !== sessionID) {
       sessionID = next
       setTitle(panelTitle())
       void load(true)
     }
-    // 必须经 createComponent 在宿主的响应式 owner 内实例化。
-    // 直接调用 QuotaPanel({...}) 不会建立 owner，组件不渲染（实测踩过）。
-    // ??= 保证只在第一次 render 时真正实例化。
-    return (panel ??= createComponent(QuotaPanel, {
+    // 必须在宿主的响应式 owner 内实例化；直接调 QuotaPanel({...}) 不建 owner，组件不渲染（实测踩过）。
+    // ⚠️ 每次 render 都必须**新建**实例，不能缓存：宿主卸载侧栏时会 dispose 挂载树，
+    // 缓存的组件实例随之变成死树，重挂时递回去的就是尸体——面板永久消失（#? 实测：
+    // render #1 创建后可见，折叠→展开 render #2 复用缓存后面板再不出现）。
+    // 旧注释拿 opencode-glm-vistatus 的 `if (!card) card = new QuotaCard(...)` 类比缓存，
+    // 那是命令式对象、自己持有可重挂的节点，不适用 Solid 组件——类比不成立，注释已删。
+    // 不会泄漏 interval：panel.tsx 的 onCleanup 会在宿主 dispose 时清掉 tickTimer/kvPollTimer。
+    return createComponent(QuotaPanel, {
       snapshot,
       title,
       theme: api.theme,
-      kv: api.kv,
+      kv,
       version: PLUGIN_VERSION,
-    }))
+    })
   }
 
   const stopReady = whenRendererReady(api, () => {

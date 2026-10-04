@@ -24,7 +24,7 @@ OpenCode v2 TUI 插件：**侧边栏自动跟随当前会话正在用的 provide
 | **DeepSeek**<br>`deepseek` | 仅账户余额 | `api.deepseek.com/user/balance` | ✅ 实测跑通 |
 | **OpenCode Go**<br>`opencode-go` | 5h · 周 · 月三窗口 | `opencode.ai/zen/go/v1/usage` | ⚠️ 已实现，成功路径待验证 |
 
-**OpenCode Go 需要你登录过才会激活**：`opencode auth login opencode-go`。本仓库的开发机上没有该订阅，代码只验证到了 401 鉴权失败分支，200 成功响应的字段名取自社区实现 —— 首次拿到 key 后请对照真实 body 校对 `src/parsers/opencode-go.ts` 的 `WINDOW_LABELS`，并用 `/quota-refresh` 确认。
+**OpenCode Go 需要你登录过才会激活**：`opencode auth login opencode-go`。本仓库的开发机上没有该订阅，代码只验证到了 401 鉴权失败分支，200 成功响应的字段名取自社区实现 —— 首次拿到 key 后请对照真实 body 校对 `src/parsers/opencode-go.ts` 的 `WINDOW_LABELS`，并观察面板自动刷新确认。
 
 > **DeepSeek 只显示余额是完整实现，不是残缺。** DeepSeek 没有 Coding Plan，只按量计费，`/user/coding_plan`、`/coding/v1/usages`、`/user/usage`、`/api/monitor/usage/quota/limit` 全部 404 —— 没有任何配额窗口接口可查。
 
@@ -97,8 +97,8 @@ src/ui/panel.tsx               Solid 面板渲染进 api.ui.slot({prepend:"sideb
 |---|---|
 | 每 **60 秒** | 重新拉一次用量（面板右上角的时钟就是 `fetchedAt`） |
 | 每 **3 秒** | 只探测 provider，**不**发网络请求；探测到变了才立刻拉一次 |
-| `/quota-refresh` | 立即重新拉取 |
-| 点标题行 | 折叠 / 展开（状态存 `quota_switch.open`） |
+| `/quota-refresh` | 立即重新拉取。⚠️ opencode 2.0.22 上**注册不上**（宿主 bug，见下文「厂商接口的坑」），60s 自动刷新是唯一刷新路径 |
+| 点标题行 | 折叠 / 展开。⚠️ 折叠/边框状态在 2.0.22 上**仅本次会话内有效**（宿主 `api.storage` 每次调用都抛异常，见下文），重启后回到默认展开 |
 
 切到白名单外的模型（比如 Claude）时，面板**保持上次的值不动** —— 刻意如此，比显示一个乱跳的数字好。
 
@@ -154,6 +154,9 @@ src/ui/panel.tsx               Solid 面板渲染进 api.ui.slot({prepend:"sideb
   ```
 
   日志落在 `~/.local/state/opencode/quota-switch.log`（0600，超 512KB 自动清空），home 绝对路径会被压成 `~`。**改这个插件前别猜字段名**——先把 trace 打开看宿主的真实 API 成员，踩过的坑都记在 `src/active-provider.ts` 注释里。
+- **`api.keymap.layer` 在 2.0.22 上永远抛 `Keymap.Provider is missing`。** setup 阶段抛，8 秒后直调也抛，塞进全新 `createRoot` 里还是抛——Solid 的 context 按 owner 链向上找，插件闭包里没有 Keymap 祖先，重试/重建 owner 都无解（重试机制试过并已撤）。结果就是 `/quota-refresh` 在该版本注册不上，只剩 60s 自动刷新。
+- **`api.storage` 在 2.0.22 上是坏的，每次调用都抛。** `store`/`memory` 实际是 `(key, value?)` 函数（宿主自动加 `plugin.<pluginId>.` 前缀），读恒抛 `undefined is not an object (evaluating 'b.initial')`，写连 `{a:1}`、`false` 都报 `Storage values must be JSON-compatible objects`；setup/+4s/+12s 表现一致，不是初始化竞态。面板的折叠/边框状态在该版本上因此仅会话内有效（适配层 `src/kv-adapter.ts` 保留探测分支：宿主修好后持久化自动生效，无需改代码）。
+- **修复记录**：侧栏折叠再展开后面板曾**永久消失**——之前缓存了 Solid 组件实例，宿主卸载侧栏时会 dispose 挂载树，缓存实例成死树，重挂时递回去的就是尸体。现在每次 render 都新建实例（`onCleanup` 保证不泄漏定时器）。
 
 ### GLM
 
