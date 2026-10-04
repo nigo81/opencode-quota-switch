@@ -1862,13 +1862,18 @@ var tui = async (api, options) => {
         setTitle(panelTitle2());
         void load(true);
       }
-      return createComponent(QuotaPanel, {
-        snapshot,
-        title,
-        theme: api.theme,
-        kv,
-        version: PLUGIN_VERSION
-      });
+      try {
+        return createComponent(QuotaPanel, {
+          snapshot,
+          title,
+          theme: api.theme,
+          kv,
+          version: PLUGIN_VERSION
+        });
+      } catch (err) {
+        trace(`render #${renderCount} THREW: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+        throw err;
+      }
     };
     const stopReady = whenRendererReady(api, () => {
       const { ok, dispose: dispose2 } = registerSidebarSlot(api, render);

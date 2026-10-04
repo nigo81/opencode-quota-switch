@@ -488,13 +488,23 @@ const tui: TuiPlugin = async (api, options) => {
     // 旧注释拿 opencode-glm-vistatus 的 `if (!card) card = new QuotaCard(...)` 类比缓存，
     // 那是命令式对象、自己持有可重挂的节点，不适用 Solid 组件——类比不成立，注释已删。
     // 不会泄漏 interval：panel.tsx 的 onCleanup 会在宿主 dispose 时清掉 tickTimer/kvPollTimer。
-    return createComponent(QuotaPanel, {
-      snapshot,
-      title,
-      theme: api.theme,
-      kv,
-      version: PLUGIN_VERSION,
-    })
+    // 宿主把每个 slot claim 都包在 ErrorBoundary(wK) 里：render 一旦抛异常，宿主
+    // 吞掉、弹一个转瞬即逝的 "Plugin crashed" toast、然后给该槽渲染 null——症状就是
+    // 「面板凭空消失、旁边 Context/MCP 毫发无伤」。宿主不打印异常栈，所以这里自己兜住
+    // 并写 trace，否则一旦在重建侧栏的路径上抛错，现场永远查不出来。
+    try {
+      return createComponent(QuotaPanel, {
+        snapshot,
+        title,
+        theme: api.theme,
+        kv,
+        version: PLUGIN_VERSION,
+      })
+    } catch (err) {
+      trace(`render #${renderCount} THREW: ${err instanceof Error ? err.stack ?? err.message : String(err)}`)
+      // 重新抛出，交给宿主 ErrorBoundary（保持既有降级语义），但 trace 已留下证据。
+      throw err
+    }
   }
 
   const stopReady = whenRendererReady(api, () => {
