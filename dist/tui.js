@@ -1,9 +1,9 @@
 // main.ts
 import { createSignal as createSignal2 } from "solid-js";
 import { createComponent } from "@opentui/solid";
-import fs2 from "node:fs";
-import os2 from "node:os";
-import path2 from "node:path";
+import fs3 from "node:fs";
+import os3 from "node:os";
+import path3 from "node:path";
 
 // src/active-provider.ts
 function rec(v) {
@@ -185,28 +185,229 @@ async function detectActiveProvider(api, preferIDs = [], known = []) {
 }
 
 // src/authfile.ts
+import fs2 from "node:fs";
+import os2 from "node:os";
+import path2 from "node:path";
+
+// src/dbcredential.ts
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-function candidatePaths() {
+import { createRequire } from "node:module";
+var NODE_SPEC = "node:sqlite";
+var BUN_SPEC = "bun:sqlite";
+var SQL = "SELECT `integration_id`, `value`, `active`, `time_updated` FROM `credential`";
+var TTL_MS = 3e4;
+function candidateDbPaths() {
   const paths = [
-    path.join(os.homedir(), ".local", "share", "opencode", "auth.json"),
-    path.join(os.homedir(), ".config", "opencode", "auth.json")
+    path.join(os.homedir(), ".local", "share", "opencode", "opencode.db"),
+    path.join(os.homedir(), ".config", "opencode", "opencode.db")
   ];
   const xdg = process.env.XDG_DATA_HOME;
-  if (xdg) paths.push(path.join(xdg, "opencode", "auth.json"));
+  if (xdg) paths.push(path.join(xdg, "opencode", "opencode.db"));
   return paths;
 }
+function ctorOf(mod, name) {
+  if (mod === null || typeof mod !== "object") return null;
+  const ctor = mod[name];
+  return typeof ctor === "function" ? ctor : null;
+}
+function nodeDriver(mod) {
+  const Ctor = ctorOf(mod, "DatabaseSync");
+  if (!Ctor) return null;
+  return {
+    name: NODE_SPEC,
+    // readOnly:true —— 硬件级只读：连「打开时建 WAL / 建 journal」都不会发生
+    open: (file) => new Ctor(file, { readOnly: true })
+  };
+}
+function bunDriver(mod) {
+  const Ctor = ctorOf(mod, "Database");
+  if (!Ctor) return null;
+  return {
+    name: BUN_SPEC,
+    // bun 的开关拼作 readonly（比 node 少个 R）；create:false 再兜一层「文件不存在就别建」
+    open: (file) => new Ctor(file, { readonly: true, create: false })
+  };
+}
+function probeSync() {
+  try {
+    const req = createRequire(import.meta.url);
+    for (const [spec, build] of [
+      [NODE_SPEC, nodeDriver],
+      [BUN_SPEC, bunDriver]
+    ]) {
+      let mod;
+      try {
+        mod = req(spec);
+      } catch {
+        continue;
+      }
+      const driver = build(mod);
+      if (driver) return driver;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+async function probeAsync() {
+  for (const [spec, build] of [
+    [NODE_SPEC, nodeDriver],
+    [BUN_SPEC, bunDriver]
+  ]) {
+    try {
+      const driver = build(await import(spec));
+      if (driver) return driver;
+    } catch {
+    }
+  }
+  return null;
+}
+var driverSync;
+var driverAsync;
+function activeDriver() {
+  if (driverSync === void 0) {
+    driverSync = probeSync();
+    if (driverSync === null) armAsyncProbe();
+  }
+  return driverSync ?? driverAsync ?? null;
+}
+function armAsyncProbe() {
+  if (driverAsync !== void 0) return;
+  void probeAsync().then((d) => {
+    driverAsync = d;
+    if (d) cache = null;
+  }).catch(() => {
+    driverAsync = null;
+  });
+}
+function normalizeActive(v) {
+  if (v === null || v === void 0) return null;
+  if (v === 1 || v === "1") return 1;
+  if (v === 0 || v === "0") return 0;
+  return null;
+}
+function parseKey(value) {
+  if (typeof value !== "string") return void 0;
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return void 0;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return void 0;
+  const rec2 = parsed;
+  if (rec2.type !== "key") return void 0;
+  const key = rec2.key;
+  if (typeof key !== "string" || key.trim() === "") return void 0;
+  return key;
+}
+function selectRows(rows) {
+  const best = /* @__PURE__ */ new Map();
+  for (const raw of rows) {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const row = raw;
+    const active = normalizeActive(row.active);
+    if (active === 0) continue;
+    const id = typeof row.integration_id === "string" ? row.integration_id.trim() : "";
+    if (id === "") continue;
+    const key = parseKey(row.value);
+    if (key === void 0) continue;
+    const rank = active === 1 ? 0 : 1;
+    const updated = typeof row.time_updated === "number" ? row.time_updated : 0;
+    const prev = best.get(id);
+    if (!prev || rank < prev.rank || rank === prev.rank && updated > prev.updated) {
+      best.set(id, { rank, updated, entry: { id, apiKey: key } });
+    }
+  }
+  return [...best.values()].map((v) => v.entry);
+}
+function queryAll(handle) {
+  try {
+    const stmt = handle.prepare?.(SQL) ?? handle.query?.(SQL);
+    if (!stmt || typeof stmt.all !== "function") return void 0;
+    const rows = stmt.all();
+    return Array.isArray(rows) ? rows : void 0;
+  } catch {
+    return void 0;
+  }
+}
+var openFn;
+function defaultOpener() {
+  if (openFn) return openFn;
+  return activeDriver()?.open;
+}
+function fileExists(p) {
+  try {
+    return fs.existsSync(p);
+  } catch {
+    return false;
+  }
+}
+function load() {
+  const opener = defaultOpener();
+  if (!opener) return { list: [], from: "(\u65E0\u53EF\u7528 SQLite runtime)", runtime: "none" };
+  const file = candidateDbPaths().find(fileExists);
+  if (file === void 0) return { list: [], from: "(\u672A\u627E\u5230 opencode.db)", runtime: runtimeName() };
+  let handle;
+  try {
+    handle = opener(file);
+  } catch {
+    return { list: [], from: "opencode.db(\u6253\u5F00\u5931\u8D25)", runtime: runtimeName() };
+  }
+  try {
+    const rows = queryAll(handle);
+    if (rows === void 0) return { list: [], from: "opencode.db(\u65E0 credential \u8868)", runtime: runtimeName() };
+    return { list: selectRows(rows), from: "opencode.db", runtime: runtimeName() };
+  } catch {
+    return { list: [], from: "opencode.db(\u8BFB\u53D6\u5931\u8D25)", runtime: runtimeName() };
+  } finally {
+    try {
+      handle.close();
+    } catch {
+    }
+  }
+}
+function runtimeName() {
+  return openFn ? "test" : activeDriver()?.name ?? "none";
+}
 var cache = null;
-var TTL_MS = 3e4;
-function readAuthFile() {
+function readDb() {
   const now = Date.now();
   if (cache && now - cache.at < TTL_MS) return cache;
+  const result = load();
+  cache = { at: now, ...result };
+  return result;
+}
+function dbCredentialProviders() {
+  return readDb().list;
+}
+function dbCredentialTrace() {
+  const { list, from, runtime } = readDb();
+  return `${from}(${runtime}) [${list.map((p) => p.id ?? "?").join(",")}]`;
+}
+
+// src/authfile.ts
+function candidatePaths() {
+  const paths = [
+    path2.join(os2.homedir(), ".local", "share", "opencode", "auth.json"),
+    path2.join(os2.homedir(), ".config", "opencode", "auth.json")
+  ];
+  const xdg = process.env.XDG_DATA_HOME;
+  if (xdg) paths.push(path2.join(xdg, "opencode", "auth.json"));
+  return paths;
+}
+var cache2 = null;
+var TTL_MS2 = 3e4;
+function readAuthFile() {
+  const now = Date.now();
+  if (cache2 && now - cache2.at < TTL_MS2) return cache2;
   let result = { list: [], from: "(\u672A\u627E\u5230 auth.json)" };
   for (const p of candidatePaths()) {
     try {
-      if (!fs.existsSync(p)) continue;
-      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (!fs2.existsSync(p)) continue;
+      const raw = JSON.parse(fs2.readFileSync(p, "utf8"));
       if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
       const list = [];
       for (const [id, value] of Object.entries(raw)) {
@@ -223,15 +424,28 @@ function readAuthFile() {
     } catch {
     }
   }
-  cache = { at: now, ...result };
+  cache2 = { at: now, ...result };
   return result;
 }
+function mergedProviders() {
+  const merged = [...dbCredentialProviders()];
+  const seen = new Set(merged.map((p) => p.id));
+  for (const entry of readAuthFile().list) {
+    if (entry.id !== void 0) {
+      if (seen.has(entry.id)) continue;
+      seen.add(entry.id);
+    }
+    merged.push(entry);
+  }
+  return merged;
+}
 function authFileProviders() {
-  return readAuthFile().list;
+  return mergedProviders();
 }
 function authFileTrace() {
   const { list, from } = readAuthFile();
-  return `${path.basename(from)} \u2192 [${list.map((p) => p.id).join(",") || "(\u7A7A)"}]`;
+  const merged = mergedProviders();
+  return `${dbCredentialTrace()} | ${path2.basename(from)} [${list.map((p) => p.id).join(",")}] \u2192 [${merged.map((p) => p.id).join(",") || "(\u7A7A)"}]`;
 }
 
 // src/http.ts
@@ -1551,31 +1765,31 @@ function resolveKV(api) {
 var PLUGIN_VERSION = "0.1.0";
 var TRACE_ENABLED = process.env.OPENCODE_QUOTA_SWITCH_TRACE !== void 0 && process.env.OPENCODE_QUOTA_SWITCH_TRACE !== "";
 var TRACE_MAX_BYTES = 512 * 1024;
-var TRACE_FILE = path2.join(os2.homedir(), ".local", "state", "opencode", "quota-switch.log");
+var TRACE_FILE = path3.join(os3.homedir(), ".local", "state", "opencode", "quota-switch.log");
 function redactHome(s) {
-  const home = os2.homedir();
+  const home = os3.homedir();
   return home ? s.split(home).join("~") : s;
 }
 function trace(msg) {
   if (!TRACE_ENABLED) return;
   try {
-    fs2.mkdirSync(path2.dirname(TRACE_FILE), { recursive: true });
+    fs3.mkdirSync(path3.dirname(TRACE_FILE), { recursive: true });
     try {
-      fs2.chmodSync(TRACE_FILE, 384);
+      fs3.chmodSync(TRACE_FILE, 384);
     } catch {
     }
-    const fd = fs2.openSync(TRACE_FILE, "a", 384);
+    const fd = fs3.openSync(TRACE_FILE, "a", 384);
     try {
-      if (fs2.fstatSync(fd).size > TRACE_MAX_BYTES) {
-        fs2.ftruncateSync(fd, 0);
-        fs2.writeSync(fd, `[${(/* @__PURE__ */ new Date()).toISOString()}] (\u8D85\u8FC7 ${TRACE_MAX_BYTES}B\uFF0C\u65E5\u5FD7\u5DF2\u6E05\u7A7A)
+      if (fs3.fstatSync(fd).size > TRACE_MAX_BYTES) {
+        fs3.ftruncateSync(fd, 0);
+        fs3.writeSync(fd, `[${(/* @__PURE__ */ new Date()).toISOString()}] (\u8D85\u8FC7 ${TRACE_MAX_BYTES}B\uFF0C\u65E5\u5FD7\u5DF2\u6E05\u7A7A)
 `);
         return;
       }
-      fs2.writeSync(fd, `[${(/* @__PURE__ */ new Date()).toISOString()}] ${redactHome(msg)}
+      fs3.writeSync(fd, `[${(/* @__PURE__ */ new Date()).toISOString()}] ${redactHome(msg)}
 `);
     } finally {
-      fs2.closeSync(fd);
+      fs3.closeSync(fd);
     }
   } catch {
   }
@@ -1584,8 +1798,8 @@ trace(`=== \u6A21\u5757\u52A0\u8F7D (pid=${process.pid}) ===`);
 function authFileTraceSafe() {
   const raw = authFileTrace();
   const i = raw.indexOf("\u2192");
-  if (i < 0) return path2.basename(raw);
-  return `${path2.basename(raw.slice(0, i).trim())} ${raw.slice(i)}`;
+  if (i < 0) return path3.basename(raw);
+  return `${path3.basename(raw.slice(0, i).trim())} ${raw.slice(i)}`;
 }
 function readOptions(raw) {
   const num = (v) => typeof v === "number" && Number.isFinite(v) ? v : void 0;
@@ -1736,7 +1950,7 @@ var tui = async (api, options) => {
       retryTimer = setTimeout(() => {
         retryTimer = void 0;
         if (stopped) return;
-        void load(true);
+        void load2(true);
       }, delay);
     };
     var activeAdapter = activeAdapter2, panelTitle = panelTitle2, scheduleRetry = scheduleRetry2;
@@ -1791,7 +2005,7 @@ var tui = async (api, options) => {
     let fetchSeq = 0;
     let stopped = false;
     let retryTimer;
-    async function load(force, probed) {
+    async function load2(force, probed) {
       const now = Date.now();
       if (!force && now - lastFetch < intervalMs - 1e3) return false;
       if (inFlight) {
@@ -1860,7 +2074,7 @@ var tui = async (api, options) => {
       if (next !== sessionID) {
         sessionID = next;
         setTitle(panelTitle2());
-        void load(true);
+        void load2(true);
       }
       try {
         return createComponent(QuotaPanel, {
@@ -1883,25 +2097,25 @@ var tui = async (api, options) => {
         guard("onDispose(dispose)", () => api.lifecycle.onDispose(dispose2));
       }
       guard("setTitle", () => setTitle(panelTitle2()));
-      void load(true);
+      void load2(true);
     });
     const offRefresh = registerRefreshCommand(api, () => {
-      void load(true);
+      void load2(true);
     });
     trace(`\u51C6\u5907\u6CE8\u518C\uFF0Ccandidates=${candidates().map((c) => c.id).join(",") || "(\u65E0)"}`);
-    trace(`\u51ED\u8BC1\u6765\u6E90 auth.json: ${authFileTraceSafe()}`);
+    trace(`\u51ED\u8BC1\u6765\u6E90 ${authFileTraceSafe()}`);
     trace(`\u5408\u5E76\u540E provider \u6761\u76EE: ${getProviders().map((p) => `${p.id}${p.baseURL ? "(\u6709baseURL)" : ""}`).join(",") || "(\u65E0)"}`);
     const dataNS = asRecord2(asRecord2(api)?.data);
     const dataOn = dataNS?.on;
     const offs = (guard(
       "data.on",
       () => typeof dataOn === "function" ? [
-        dataOn.call(dataNS, "message.updated", () => void load(false)),
-        dataOn.call(dataNS, "session.updated", () => void load(false)),
-        dataOn.call(dataNS, "session.idle", () => void load(true))
+        dataOn.call(dataNS, "message.updated", () => void load2(false)),
+        dataOn.call(dataNS, "session.updated", () => void load2(false)),
+        dataOn.call(dataNS, "session.idle", () => void load2(true))
       ] : []
     ) ?? []).filter((off) => typeof off === "function");
-    const timer = setInterval(() => void load(false), intervalMs);
+    const timer = setInterval(() => void load2(false), intervalMs);
     const watchTimer = setInterval(() => {
       void (async () => {
         if (stopped) return;
@@ -1910,7 +2124,7 @@ var tui = async (api, options) => {
         if (stopped) return;
         if (detectedProviderID !== before) {
           setTitle(panelTitle2());
-          if (!load(true, { providerID: detectedProviderID })) {
+          if (!load2(true, { providerID: detectedProviderID })) {
             trace("watchTimer\uFF1A\u672C\u6B21 load \u88AB\u8DF3\u8FC7\uFF0C\u6392\u4E00\u8F6E\u91CD\u8BD5");
             scheduleRetry2();
           }
@@ -1926,14 +2140,14 @@ var tui = async (api, options) => {
       offRefresh();
       offs.forEach((off) => off());
     };
-    for (const [obj, path3] of [
+    for (const [obj, path4] of [
       [api, "api.lifecycle.onDispose"],
       [asRecord2(api)?.app, "api.app.onDispose"],
       [asRecord2(api)?.renderer, "api.renderer.onDispose"]
     ]) {
       const fn = obj?.onDispose;
       if (typeof fn === "function") {
-        guard(path3, () => fn.call(obj, dispose));
+        guard(path4, () => fn.call(obj, dispose));
         break;
       }
     }

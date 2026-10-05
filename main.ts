@@ -528,7 +528,7 @@ const tui: TuiPlugin = async (api, options) => {
   // 消息更新 = 可能换 provider；空闲 = 一次问答结束，两个都要重新判定。
   // v2.0.21 实测没有 api.event，事件总线是 api.data.on（成员 on/listen/session/project/…）。
   trace(`准备注册，candidates=${candidates().map((c) => c.id).join(",") || "(无)"}`)
-  trace(`凭证来源 auth.json: ${authFileTraceSafe()}`)
+  trace(`凭证来源 ${authFileTraceSafe()}`)
   trace(`合并后 provider 条目: ${getProviders().map((p) => `${p.id}${p.baseURL ? "(有baseURL)" : ""}`).join(",") || "(无)"}`)
   const dataNS = asRecord(asRecord(api)?.data)
   const dataOn = dataNS?.on as ((e: string, cb: () => void) => unknown) | undefined

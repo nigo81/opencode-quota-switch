@@ -34,7 +34,7 @@ OpenCode v2 TUI 插件：**侧边栏自动跟随当前会话正在用的 provide
 
 | Provider | 卡在哪 |
 |---|---|
-| 火山方舟 / 豆包 | 控制面只认 volc-sso 登录态或 AK/SK V4 签名。`auth.json` 里的 key 是**数据面** key，对配额无效（`arkcli usage plan --api-key` 明确报 `--api-key only applies to data-plane commands`） |
+| 火山方舟 / 豆包 | 控制面只认 volc-sso 登录态或 AK/SK V4 签名。凭证表里的 key 是**数据面** key，对配额无效（`arkcli usage plan --api-key` 明确报 `--api-key only applies to data-plane commands`） |
 | 阿里百炼 | 官方 FAQ 原文「暂无法查看」「不支持」，实测 10 个候选路径全 404 |
 | 腾讯混元 | `api.lkeap.cloud.tencent.com` 先鉴权后路由，假 key 探测路径完全无效 |
 | 阶跃星辰 | `/v1/accounts` 可用，但 Step Plan 是独立 Credit 体系，12 个候选路径全 404 |
@@ -55,9 +55,18 @@ npm install && npm run build
 
 `install.sh` 把仓库软链进 OpenCode 的 TUI 插件缓存（`~/.cache/opencode/npm/`），并在 `~/.config/opencode/cli.json` 的 `plugins` 数组注册裸包名。**改完代码重跑 `npm run build && ./install.sh`，重启 OpenCode 客户端即生效**，不用重新发布。
 
-> **为什么不用 `opencode plugin add <git-url>`**：opencode 2.0.21 会失败并报 `NpmInstallFailedError: git dep preparation failed`。同一个 git 依赖用 npm 与 bun 单独安装都成功，所以是宿主安装器自身的 bug。本地路径 spec（`./x`、`file:./x`）在 V2 也不支持。缓存注入走的是宿主加载 npm 插件时本来就会读的目录，实测可用。
+> **为什么不用 `opencode plugin add <git-url>`**：这是宿主安装器自身的 bug，2.0.21 报 `NpmInstallFailedError: git dep preparation failed`，2.0.22 更隐蔽 —— **静默失败**：无任何输出、`~/.cache/opencode/npm/` 下只留一个空目录，还顺手把 `~/.config/opencode/cli.json` 的 `plugins` 清空成 `[]`（等于把已装的插件全卸了）。同一个 git 依赖用 npm 与 bun 单独安装都成功，所以不是依赖本身的问题。本地路径 spec（`./x`、`file:./x`）在 V2 也不支持。缓存注入走的是宿主加载 npm 插件时本来就会读的目录，实测可用。
 
-**API key 从哪来**：宿主没有暴露 provider 列表和凭证，插件直接读 `~/.local/share/opencode/auth.json`（只读、30s TTL 缓存），只放进内存去打厂商自己的 HTTPS 接口 —— 不落盘、不打日志、不进错误文案。
+**API key 从哪来**：宿主没有暴露 provider 列表和凭证，插件自己只读地读两个来源，**SQLite 优先**：
+
+| 来源 | 路径 | 说明 |
+|---|---|---|
+| **v2 主来源** | `~/.local/share/opencode/opencode.db` 的 `credential` 表 | TUI `/connect` 换账号后凭证落在这里，明文 JSON（`{"type":"key","key":"sk-…"}`）。只认 `type = "key"` 的行；同一 `integration_id` 多行时 `active = 1` 优先，其次 `active IS NULL`（从 auth.json 迁来的老凭证），`active = 0`（已被新凭证取代）直接忽略 |
+| **旧版本 / 降级** | `~/.local/share/opencode/auth.json` | v2 只在迁移时读它一次，运行时**不再读**。保留作 1.x 和干净安装的降级路径，SQLite 缺哪个 `integration_id` 就用它补 |
+
+只读打开（`readOnly` / `readonly`），30s TTL 缓存，**每次读完立刻关句柄**（DB 有 8.2 GB，不能留给 GC）。key 只放进内存去打厂商自己的 HTTPS 接口 —— 不落盘、不打日志、不进错误文案、不进 trace。SQLite 读不出来（运行时没有 `node:sqlite`/`bun:sqlite`、文件不存在、没有 `credential` 表、解析失败）就静默降级到 auth.json，绝不抛错打断面板。
+
+runtime 探测：宿主二进制是 bun 打包的，但静态看不出插件跑在哪个 runtime，所以 `node:sqlite` 的 `DatabaseSync` 和 `bun:sqlite` 的 `Database` 都会**动态 import 试一遍**，先成功的赢；两个都没有也不报错。
 
 ### 卸载
 
@@ -72,6 +81,8 @@ rm -rf ~/.cache/opencode/npm/opencode-quota-switch@latest
 api.client.session.list()      宿主 API
       ↓  按 time.viewed 倒序
 当前会话的 model.providerID     → 白名单校验（必须在有凭证的 providerID 内）
+      ↓
+src/dbcredential.ts + src/authfile.ts   凭证来源合并：opencode.db 的 credential 表优先，auth.json 补漏
       ↓
 src/providers/index.ts         providerID → adapter
       ↓
@@ -146,7 +157,7 @@ src/ui/panel.tsx               Solid 面板渲染进 api.ui.slot({prepend:"sideb
 - **模块必须同时导出 `{ id, tui, setup }`。** 只导出 `tui` 的话，模块顶层会执行但入口永不被调用（V2 宿主读的是 `setup`）。
 - **必须用 `createComponent(QuotaPanel, {...})` 在宿主的响应式 owner 内实例化**，直接调 `QuotaPanel({...})` 不建 owner、不渲染。
 - **打包必须用 `generate: "universal"` + `moduleName: "@opentui/solid"`**（默认的 `solid-js/web` 是 DOM 那套，渲染到 opentui 上不显示），且产物必须是预打包的 `dist/tui.js` —— 宿主加载 npm 缓存中的 TUI 插件走「已打包产物」路径，发裸 TS 会报 `Cannot find package 'solid-js' imported from .../src/ui/panel.tsx`。
-- **宿主不打印 setup 内的异常栈**，且 `api.lifecycle` 是 `undefined`（`@opencode-ai/plugin` 的类型声明与 v2.0.21 运行时不同步，别信它）。排查只能自己建 trace，**默认静默**，要开必须自己 export 环境变量：
+- **宿主不打印 setup 内的异常栈**，且 `api.lifecycle` 在 2.0.21 和 2.0.22 上都是 `undefined`（`@opencode-ai/plugin` 的类型声明仍停在 1.15.10，与 v2 运行时不同步，别信它）。排查只能自己建 trace，**默认静默**，要开必须自己 export 环境变量：
 
   ```bash
   OPENCODE_QUOTA_SWITCH_TRACE=1 opencode
@@ -157,6 +168,7 @@ src/ui/panel.tsx               Solid 面板渲染进 api.ui.slot({prepend:"sideb
 - **`api.keymap.layer` 在 2.0.22 上永远抛 `Keymap.Provider is missing`。** setup 阶段抛，8 秒后直调也抛，塞进全新 `createRoot` 里还是抛——Solid 的 context 按 owner 链向上找，插件闭包里没有 Keymap 祖先，重试/重建 owner 都无解（重试机制试过并已撤）。结果就是 `/quota-refresh` 在该版本注册不上，只剩 60s 自动刷新。
 - **`api.storage` 在 2.0.22 上是坏的，每次调用都抛。** `store`/`memory` 实际是 `(key, value?)` 函数（宿主自动加 `plugin.<pluginId>.` 前缀），读恒抛 `undefined is not an object (evaluating 'b.initial')`，写连 `{a:1}`、`false` 都报 `Storage values must be JSON-compatible objects`；setup/+4s/+12s 表现一致，不是初始化竞态。面板的折叠/边框状态在该版本上因此仅会话内有效（适配层 `src/kv-adapter.ts` 保留探测分支：宿主修好后持久化自动生效，无需改代码）。
 - **修复记录**：侧栏折叠再展开后面板曾**永久消失**——之前缓存了 Solid 组件实例，宿主卸载侧栏时会 dispose 挂载树，缓存实例成死树，重挂时递回去的就是尸体。现在每次 render 都新建实例（`onCleanup` 保证不泄漏定时器）。
+- **v2 的 `/connect` 根本不写 auth.json，面板却还在读它。** 现象：在 TUI 里 `/connect` 换成新账号，面板配额数字纹丝不动，还是旧账号的。原因：OpenCode 2.x 把 `/connect` 的凭证写进 SQLite `~/.local/share/opencode/opencode.db` 的 `credential` 表（`value` 是明文 JSON `{"type":"key","key":…}`），而 auth.json 在 v2 只被一次 migration 读过，**运行时不再读** —— 插件于是一直拿着被停用的旧 key。`active` 语义有坑：`1`=生效中、`0`=被新凭证取代、`NULL`=从 auth.json 迁移来的老凭证，所以 `ORDER BY active DESC` 会把停用的旧 key 排到最前。修复：新增 `src/dbcredential.ts` 只读 `credential` 表（`active = 1` > `active IS NULL`，`active = 0` 直接忽略，只认 `type = "key"`），SQLite 优先、auth.json 补漏合并进 `authFileProviders()`；DB 不存在 / 无表 / 解析失败静默降级。`node:sqlite` 与 `bun:sqlite` 动态 import 挨个试（宿主是 bun 打包但静态看不出 runtime），两个都没有也不报错。
 
 ### GLM
 
@@ -195,10 +207,13 @@ Z.AI 这类接口业务失败返回 **HTTP 200 + body 里带错误码**（`{"cod
 npm install
 npm run build       # tsc --noEmit + esbuild 打包成 dist/tui.js
 npm run typecheck
+npm test            # node 自带 test runner（凭证源合并逻辑的 16 个用例，无外部测试依赖）
 npx tsx scripts/smoke-quota.ts   # 绕开 UI 直连各家真实接口，验 parser 契约
 ```
 
-**改完 adapter 先跑 smoke。** 它读 `~/.local/share/opencode/auth.json` 里真实存在的凭证去打真实接口，打印每家的窗口和百分比 —— 比开 OpenCode 看面板快得多。没有凭证的 provider 会自动跳过。
+**改完 adapter 先跑 smoke。** 它走 `authFileProviders()`（SQLite `credential` 表优先、auth.json 补漏）拿真实存在的凭证去打真实接口，打印每家的窗口和百分比 —— 比开 OpenCode 看面板快得多。没有凭证的 provider 会自动跳过。
+
+测试用 `node --test` 跑 TS，靠 `scripts/ts-resolve.mjs` 把 `./x.js` specifier 映射到 `./x.ts`（Node 的类型剥离不重写路径，tsc/tsx 会）。SQLite 依赖用 `src/dbcredential.ts` 导出的 `__setSqliteOpener()` 注入假 opener，生产路径不引入任何单例或依赖。
 
 `reference/` 存放上游 `opencode-quota-usage@0.3.7` 的原始文件，仅供对照开发，不参与编译也不发布。
 
