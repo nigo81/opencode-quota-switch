@@ -91,7 +91,7 @@ src/parsers/*.ts               纯函数解析，无网络、无依赖
 src/ui/panel.tsx               Solid 面板渲染进 api.ui.slot({prepend:"sidebar.content"})
 ```
 
-**判定当前 provider 的过程**：宿主没有「当前模型」这个 API（`api.ui.model.current` 是 `undefined`），所以只能从会话反推 —— 列出所有会话，按最后查看时间 `time.viewed` 取最新的一个，读它的 `model.providerID`。
+**判定当前 provider 的过程**：宿主没有「当前模型」这个 API（`api.ui.model.current` 是 `undefined`），所以只能从会话反推 —— 列出所有会话，**排除子会话**（有 `parentID` 的），按最后查看时间 `time.viewed` 取最新的一个，读它的 `model.providerID`。
 
 几个踩过的坑（都在 `src/active-provider.ts` 注释里）：
 
@@ -100,7 +100,11 @@ src/ui/panel.tsx               Solid 面板渲染进 api.ui.slot({prepend:"sideb
 - 白名单是必须的：`api.data.session.status()` 会返回字符串 `"idle"`，不校验就会把 `"idle"` 当成 providerID
 - 探测失败时**沿用上次结果**，不回落成列表第一个（否则每 3 秒闪一次 GLM）
 
-子会话不污染判定：`time.viewed` 榜上排前面的始终是主会话。
+子会话不污染判定（2026-10-21 修）：子会话（subagent 跑的会话）**没有** `time.viewed`，而它们的 `time.updated` 总是最新 —— 子 agent 最后才结束。原先没有 `viewed` 就回落到 `updated`，于是刚结束的 oracle 子会话（跑在 GLM 上）会把面板抢成 GLM。现在改成：
+
+- 有 `parentID` / `parent_id` 的**子会话直接排除**
+- 打分**分两档**：tier 1 = 有 `time.viewed`（或 `time` 是裸数字），tier 2 = 只有 `time.updated` / `time.created`
+- 候选先按档位排、档内按时间倒序 —— 只要还有一条带 `viewed` 的，第一名一定来自 viewed 档；全部都没有 `viewed` 时才整体回落到 `updated`（保底）
 
 ### 刷新时机
 

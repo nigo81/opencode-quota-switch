@@ -9,33 +9,49 @@ import path3 from "node:path";
 function rec(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v) ? v : void 0;
 }
-function pickMostViewedSession(list) {
-  let best;
-  for (const item of list) {
-    const s = rec(item);
-    if (!s) continue;
-    const score = sessionTimeScore(s);
-    if (!score) continue;
-    if (!best || score.t > best.t) best = { s, t: score.t, by: score.by };
+function isSubSession(s) {
+  for (const key of ["parentID", "parent_id"]) {
+    const v = s[key];
+    if (typeof v === "string" && v !== "") return true;
   }
-  if (!best) return void 0;
-  const id = typeof best.s.id === "string" ? best.s.id : void 0;
-  return { session: best.s, id, rankBy: best.by };
+  return false;
 }
 function sessionTimeScore(s) {
   const t = s.time;
-  if (typeof t === "number") return { t, by: "time" };
+  if (typeof t === "number") return { t, by: "time", tier: 1 };
   const r = rec(t);
   if (!r) return void 0;
-  for (const k of ["viewed", "updated", "created"]) {
+  const viewed = r.viewed;
+  if (typeof viewed === "number") return { t: viewed, by: "time.viewed", tier: 1 };
+  for (const k of ["updated", "created"]) {
     const v = r[k];
-    if (typeof v === "number") return { t: v, by: `time.${k}` };
+    if (typeof v === "number") return { t: v, by: `time.${k}`, tier: 2 };
   }
   for (const k of Object.keys(r)) {
     const v = r[k];
-    if (typeof v === "number") return { t: v, by: `time.${k}` };
+    if (typeof v === "number") return { t: v, by: `time.${k}`, tier: 2 };
   }
   return void 0;
+}
+function rankSessions(list) {
+  const cands = [];
+  for (const item of list) {
+    const s = rec(item);
+    if (!s) continue;
+    if (isSubSession(s)) continue;
+    const score = sessionTimeScore(s);
+    if (!score) continue;
+    cands.push({ s, t: score.t, by: score.by, tier: score.tier });
+  }
+  cands.sort((a, b) => b.tier - a.tier || b.t - a.t);
+  return cands;
+}
+function pickMostViewedSession(list) {
+  const best = rankSessions(list)[0];
+  if (!best) return void 0;
+  const id = typeof best.s.id === "string" ? best.s.id : void 0;
+  const rankBy = best.tier === 1 ? `viewed(${best.by})` : `\u515C\u5E95(${best.by})`;
+  return { session: best.s, id, rankBy };
 }
 var KEY_LIST_MAX = 12;
 function keyList(v) {
@@ -129,11 +145,7 @@ async function detectActiveProvider(api, preferIDs = [], known = []) {
       const best = pickMostViewedSession(arr);
       const id = pickProviderIDFromModelLike(best?.session, known);
       if (id) {
-        const top = arr.map((s) => {
-          const r = rec(s) ?? {};
-          const sc = sessionTimeScore(r);
-          return sc ? { id: String(r.id ?? "?").slice(-6), t: sc.t, by: sc.by } : void 0;
-        }).filter((x) => x !== void 0).sort((x, y) => y.t - x.t).slice(0, 3).map((x) => `${x.id}:${x.by}=${x.t}`).join(" ");
+        const top = rankSessions(arr).slice(0, 3).map((x) => `${String(x.s.id ?? "?").slice(-6)}:${x.tier === 1 ? "" : "\u515C\u5E95:"}${x.by}=${x.t}`).join(" ");
         notes.push(
           `client.session.list() ${arr.length} \u6761 \u2192 \u5F53\u524D\u4F1A\u8BDD \u2026${best?.id?.slice(-6)} (${best?.rankBy}) \u2192 ${id} | top3 ${top}`
         );

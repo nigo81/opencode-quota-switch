@@ -20,42 +20,87 @@ function rec(v: unknown): Rec | undefined {
 }
 
 /**
+ * 子会话（subagent 会话）不算「用户正在看的那个」。
+ *
+ * 宿主 DB（session_v2）里子会话的 time_viewed 恒为 NULL，而 time_updated 总是最新 ——
+ * 子 agent 最后才结束。于是刚结束的子会话靠 updated 抢到第一，面板就跳成子 agent 用的 provider。
+ * parentID / parent_id 两种拼写都认：API 层和 DB 层命名不一致。
+ */
+function isSubSession(s: Rec): boolean {
+  for (const key of ["parentID", "parent_id"]) {
+    const v = s[key]
+    if (typeof v === "string" && v !== "") return true
+  }
+  return false
+}
+
+/** 排序分档：1 = 有 viewed 信号（用户确实看过）；2 = 只有 updated/created 之类 */
+type Tier = 1 | 2
+
+type TimeScore = { t: number; by: string; tier: Tier }
+
+/**
+ * 从 `time`（数字或对象）里取排序分值。
+ *
+ * 分两档是这次修复的核心：viewed 才代表「用户真的在看这个会话」，
+ * updated 只说明「最近被动过」—— 子会话的 updated 永远是最新的，抢不得第一。
+ * time 是裸数字时没有字段名可依，但按等价信号算 tier 1（时间越新越像当前会话）。
+ */
+function sessionTimeScore(s: Rec): TimeScore | undefined {
+  const t = s.time
+  if (typeof t === "number") return { t, by: "time", tier: 1 }
+  const r = rec(t)
+  if (!r) return undefined
+  const viewed = r.viewed
+  if (typeof viewed === "number") return { t: viewed, by: "time.viewed", tier: 1 }
+  for (const k of ["updated", "created"]) {
+    const v = r[k]
+    if (typeof v === "number") return { t: v, by: `time.${k}`, tier: 2 }
+  }
+  // 结构变了就随便取一个数字字段，别让整层探测瘫掉
+  for (const k of Object.keys(r)) {
+    const v = r[k]
+    if (typeof v === "number") return { t: v, by: `time.${k}`, tier: 2 }
+  }
+  return undefined
+}
+
+/**
+ * 候选排序：先按档位，档内按时间倒序。
+ *
+ * 只要还有一条带 viewed 的候选，第一名就一定来自 viewed 那一档；
+ * 全都没有 viewed 时才整体回落到 updated/created（保底：至少挑个最近被动过的）。
+ */
+function rankSessions(list: unknown[]): { s: Rec; t: number; by: string; tier: Tier }[] {
+  const cands: { s: Rec; t: number; by: string; tier: Tier }[] = []
+  for (const item of list) {
+    const s = rec(item)
+    if (!s) continue
+    if (isSubSession(s)) continue
+    const score = sessionTimeScore(s)
+    if (!score) continue
+    cands.push({ s, t: score.t, by: score.by, tier: score.tier })
+  }
+  cands.sort((a, b) => b.tier - a.tier || b.t - a.t)
+  return cands
+}
+
+/**
  * 从会话列表里挑出「用户正在看的那个」。
  *
  * API 层的会话条目（v2.0.21 实测 key 名单）：
  *   id, projectID, agent, model, cost, tokens, time, title, location
  * 时间收在 `time` 里，不是 DB 的列名 time_viewed / time_updated —— 一开始按列名写所以 50 条全落空。
+ *
+ * 排除子会话 + 只按 viewed 打分（2026-10-21 修）：子会话的 updated 总是最新，
+ * 不排掉它就会把面板带去子 agent 的 provider。
  */
 function pickMostViewedSession(list: unknown[]): { session: Rec; id?: string; rankBy: string } | undefined {
-  let best: { s: Rec; t: number; by: string } | undefined
-  for (const item of list) {
-    const s = rec(item)
-    if (!s) continue
-    const score = sessionTimeScore(s)
-    if (!score) continue
-    if (!best || score.t > best.t) best = { s, t: score.t, by: score.by }
-  }
+  const best = rankSessions(list)[0]
   if (!best) return undefined
   const id = typeof best.s.id === "string" ? best.s.id : undefined
-  return { session: best.s, id, rankBy: best.by }
-}
-
-/** 从 `time`（数字或对象）里取排序分值。viewed 优先，回落 updated。 */
-function sessionTimeScore(s: Rec): { t: number; by: string } | undefined {
-  const t = s.time
-  if (typeof t === "number") return { t, by: "time" }
-  const r = rec(t)
-  if (!r) return undefined
-  for (const k of ["viewed", "updated", "created"]) {
-    const v = r[k]
-    if (typeof v === "number") return { t: v, by: `time.${k}` }
-  }
-  // 结构变了就随便取一个数字字段，别让整层探测瘫掉
-  for (const k of Object.keys(r)) {
-    const v = r[k]
-    if (typeof v === "number") return { t: v, by: `time.${k}` }
-  }
-  return undefined
+  const rankBy = best.tier === 1 ? `viewed(${best.by})` : `兜底(${best.by})`
+  return { session: best.s, id, rankBy }
 }
 
 /** 只打 key 名单，不回显值 —— 防把凭证之类的东西写进日志 */
@@ -200,16 +245,9 @@ export async function detectActiveProvider(
       const id = pickProviderIDFromModelLike(best?.session, known)
       if (id) {
         // 顺带打前 3 名的分数，方便和 DB 的 time_viewed 交叉核对
-        const top = arr
-          .map((s) => {
-            const r = rec(s) ?? {}
-            const sc = sessionTimeScore(r)
-            return sc ? { id: String(r.id ?? "?").slice(-6), t: sc.t, by: sc.by } : undefined
-          })
-          .filter((x): x is { id: string; t: number; by: string } => x !== undefined)
-          .sort((x, y) => y.t - x.t)
+        const top = rankSessions(arr)
           .slice(0, 3)
-          .map((x) => `${x.id}:${x.by}=${x.t}`)
+          .map((x) => `${String(x.s.id ?? "?").slice(-6)}:${x.tier === 1 ? "" : "兜底:"}${x.by}=${x.t}`)
           .join(" ")
         notes.push(
           `client.session.list() ${arr.length} 条 → 当前会话 …${best?.id?.slice(-6)} (${best?.rankBy}) → ${id} | top3 ${top}`,
