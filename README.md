@@ -78,10 +78,19 @@ rm -rf ~/.cache/opencode/npm/opencode-quota-switch@latest
 ## 工作原理
 
 ```
-api.client.session.list()      宿主 API
-      ↓  按 time.viewed 倒序
-当前会话的 model.providerID     → 白名单校验（必须在有凭证的 providerID 内）
+渲染 props.sessionID（宿主 render props 传的当前会话 id）
       ↓
+api.client.session.list()      宿主 API
+      ↓
+      ├─ ① 按 id 精确匹配（唯一能确定「是哪个会话」的信号）
+      │    └─ 命中 → model.providerID
+      │
+      └─ ② 没命中才按时间猜：排除子会话 + tier 分档排序
+                 （tier1 = 有 time.viewed 优先，档内时间倒序）
+           └─ model.providerID
+                     ↓
+        白名单校验（必须在有凭证的 providerID 内）
+                     ↓
 src/dbcredential.ts + src/authfile.ts   凭证来源合并：opencode.db 的 credential 表优先，auth.json 补漏
       ↓
 src/providers/index.ts         providerID → adapter
@@ -91,7 +100,17 @@ src/parsers/*.ts               纯函数解析，无网络、无依赖
 src/ui/panel.tsx               Solid 面板渲染进 api.ui.slot({prepend:"sidebar.content"})
 ```
 
-**判定当前 provider 的过程**：宿主没有「当前模型」这个 API（`api.ui.model.current` 是 `undefined`），所以只能从会话反推 —— 列出所有会话，**排除子会话**（有 `parentID` 的），按最后查看时间 `time.viewed` 取最新的一个，读它的 `model.providerID`。
+**判定当前 provider 的过程**：分五层，从上往下，命中即返回。
+
+1. **`api.ui.model.current()`**（首选）：宿主**主动告知**的当前模型，与状态栏显示的同源（`host.local.model.selection()`），零往返、不依赖任何会话启发式 —— 比「会话里存的最后用过的模型」更接近「我现在在用什么」。返回 `{ providerID, modelID, variant }`。
+2. **按 `sessionID` 精确匹配**：宿主把当前会话 id 通过槽位 render props 传进来（`props.sessionID`，camelCase，2.0.22 起；`props.session_id` 留作旧版兜底）。拿它去 `client.session.list()` 的返回里找 `id` 对得上的那条，读它的 `model.providerID`。这是**唯一能确定「是哪个会话」的信号** —— 会话条目里的 `model` 是「**该会话最后用过的模型**」，不是宿主当前选中的模型，光靠时间排序猜不出来。
+3. **`client.session.list()` 按时间猜**：排除子会话 + tier 分档排序。**只在没有精确匹配时才生效** —— 宿主没给 sessionID，或那个会话已经不在列表里。
+4. **`api.data.session` 的成员方法**：独立事件总线，侧边栏插槽可能同步得比 client 更早。
+5. **`client.model` 列表**：没有「当前」语义，只把出现过的 providerID 列出来供对照。
+
+第 2 层和第 3 层共用同一次 `client.session.list()` 的结果，每轮探测只打一遍 API。
+
+**探到了但本插件不支持的 provider 怎么办**：探测结果先过一道「本插件支持吗」的检查（`isSupportedProviderID`，即能不能映射到某个 adapter）。不支持的（Claude 的 `anthropic`、`github-copilot` 等）**不覆盖**上一次的结果 —— 面板保持上一次的 provider 数据不动，也不发任何厂商请求。启动时当前模型就不支持、还没有「上一次」可保持时，面板显示中性提示「当前模型 X 不在本插件支持范围」，标题保持「套餐 Quota」，不写死任何 provider 名。这一条不能省：覆盖成不支持的 provider 会让 adapter 查找落空、回落到候选列表首个（GLM），拿 GLM 的额度冒充当前模型。同理，`providers` 白名单里没列的 provider 也按「不支持」处理 —— 白名单是用户的显式意图，不能被探测结果绕过。
 
 几个踩过的坑（都在 `src/active-provider.ts` 注释里）：
 
@@ -99,6 +118,10 @@ src/ui/panel.tsx               Solid 面板渲染进 api.ui.slot({prepend:"sideb
 - 会话的时间字段在 API 层叫 `time`（对象），**不叫** `time_viewed` / `time_updated`（那是 DB 列名）
 - 白名单是必须的：`api.data.session.status()` 会返回字符串 `"idle"`，不校验就会把 `"idle"` 当成 providerID
 - 探测失败时**沿用上次结果**，不回落成列表第一个（否则每 3 秒闪一次 GLM）
+- **宿主 API 的成员可能是方法不是值**：`api.ui.model.current` 在 v2.2.5 是**方法**（`current() { … host.local.model.selection() … }`），插件早期版本把它当「值」读，而取值工具只接受对象 → 函数被拒收 → **这一层实际是死代码**。探测层要「是函数就调用它」，返回值再解析。
+- **`session.list()` 默认只返回最新 50 条**（SDK 注释原文 "Defaults to the newest 50 sessions"），子会话也占行 —— 重度使用 subagent 时当前会话会掉出这批，精确匹配直接失效。探测要**显式传 limit**（插件用 `{ limit: 200 }`，失败则退回无参调用）。
+- **会话里的 `model` 是「这个会话最后用过的模型」，不是宿主当前选中的模型** —— 只靠时间排序定位不到「是哪个会话」，得用宿主给的 `sessionID` 精确匹配（2026-11-01 修）
+- **tier 分档的档位必须升序排**（`a.tier - b.tier`）：写成降序（`b.tier - a.tier`）会让「没被打开过的会话」压过「用户正在看的会话」（2026-11-01 修，面板显示成 DeepSeek 就是这么来的，详见下）
 
 子会话不污染判定（2026-10-21 修）：子会话（subagent 跑的会话）**没有** `time.viewed`，而它们的 `time.updated` 总是最新 —— 子 agent 最后才结束。原先没有 `viewed` 就回落到 `updated`，于是刚结束的 oracle 子会话（跑在 GLM 上）会把面板抢成 GLM。现在改成：
 
@@ -106,16 +129,18 @@ src/ui/panel.tsx               Solid 面板渲染进 api.ui.slot({prepend:"sideb
 - 打分**分两档**：tier 1 = 有 `time.viewed`（或 `time` 是裸数字），tier 2 = 只有 `time.updated` / `time.created`
 - 候选先按档位排、档内按时间倒序 —— 只要还有一条带 `viewed` 的，第一名一定来自 viewed 档；全部都没有 `viewed` 时才整体回落到 `updated`（保底）
 
+⚠️ 档位是**升序**排的（tier 1 在前），这一条**写反过**（2026-11-01 修）：写成降序（`b.tier - a.tier`）时，没被打开过的会话会压过用户正在看的会话。宿主 v2.2.5 的 `GET /api/session` 实测 50 条会话里只有 9 条带 `time.viewed`，没 `viewed` 的那一大池（探针会话、从未打开过的会话）按 `time.updated` 排到了最前 —— 2026-11-01 上午面板显示成 DeepSeek 就是这么来的：两条 `opencode run --model deepseek/deepseek-flash` 探针根会话在那一池里 `time.updated` 最新，顶掉了用户真正在看的 MiniMax 会话。用户新建 tab 后曾短暂显示正确（新会话还没 `viewed`，落在 tier 2 且 `updated` 最新＝它自己），等宿主给它补上 `viewed` 升到 tier 1 后，反被探针会话压下去又变回 DeepSeek。
+
 ### 刷新时机
 
 | 时机 | 行为 |
 |---|---|
 | 每 **60 秒** | 重新拉一次用量（面板右上角的时钟就是 `fetchedAt`） |
-| 每 **3 秒** | 只探测 provider，**不**发网络请求；探测到变了才立刻拉一次 |
+| 每 **3 秒** | 只探测 provider，**不**请求任何厂商配额接口（探测只调宿主本地 API，如 `client.session.list()`）；探测到变了才立刻拉一次 |
 | `/quota-refresh` | 立即重新拉取。⚠️ opencode 2.0.22 上**注册不上**（宿主 bug，见下文「厂商接口的坑」），60s 自动刷新是唯一刷新路径 |
 | 点标题行 | 折叠 / 展开。⚠️ 折叠/边框状态在 2.0.22 上**仅本次会话内有效**（宿主 `api.storage` 每次调用都抛异常，见下文），重启后回到默认展开 |
 
-切到白名单外的模型（比如 Claude）时，面板**保持上次的值不动** —— 刻意如此，比显示一个乱跳的数字好。
+切到白名单外的模型（比如 Claude）时，面板**保持上次的值不动** —— 刻意如此，比显示一个乱跳的数字好。实现方式：探测到不支持的 provider 时不覆盖上一次的结果、也不发厂商请求（详见上文「工作原理」）；启动时当前模型就不支持的话，面板显示中性提示「当前模型 X 不在本插件支持范围」。
 
 ## 配置
 
@@ -211,7 +236,7 @@ Z.AI 这类接口业务失败返回 **HTTP 200 + body 里带错误码**（`{"cod
 npm install
 npm run build       # tsc --noEmit + esbuild 打包成 dist/tui.js
 npm run typecheck
-npm test            # node 自带 test runner（凭证源合并逻辑的 16 个用例，无外部测试依赖）
+npm test            # node 自带 test runner（33 个用例：凭证源合并 16 + 活跃 provider 探测 14 + provider 支持判定 3，无外部测试依赖）
 npx tsx scripts/smoke-quota.ts   # 绕开 UI 直连各家真实接口，验 parser 契约
 ```
 

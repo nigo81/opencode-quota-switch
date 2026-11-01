@@ -12,13 +12,18 @@ import path from "node:path"
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { detectActiveProvider } from "./src/active-provider.js"
 import { authFileProviders, authFileTrace } from "./src/authfile.js"
-import { availableAdapters, adapterForProviderId, fetchQuota } from "./src/providers/index.js"
+import {
+  availableAdapters,
+  adapterForProviderId,
+  fetchQuota,
+  isSupportedProviderID,
+} from "./src/providers/index.js"
 import { QuotaPanel } from "./src/ui/index.js"
 import { resolveKV } from "./src/kv-adapter.js"
 import type { ProviderLike, QuotaSnapshot } from "./src/types.js"
 
 /** 面板头部显示的版本号，与 package.json 保持一致 */
-const PLUGIN_VERSION = "0.1.0"
+const PLUGIN_VERSION = "0.1.1"
 
 /**
  * 排障 trace：宿主加载 TUI 插件时，槽位注册与渲染这两阶段不写任何日志，
@@ -303,6 +308,22 @@ const tui: TuiPlugin = async (api, options) => {
   // camelCase sessionID，render 里已适配），所以活跃 provider 仍主要靠探测宿主模型状态。
   // 探测是异步的，结果缓存在 detectedProviderID 里供同步的 activeAdapter 读。
   let detectedProviderID: string | undefined
+  /**
+   * 探测到了、但本插件不支持的 providerID（如 Claude 的 anthropic）。
+   * 与 detectedProviderID 是两回事：detected 是「上次探到的、支持的那个」，
+   * 这个是「当前模型查不了」—— 面板要保持上一次的 provider 数据不动，
+   * 启动时就没有「上一次」可保持，才用它显示中性提示。
+   */
+  let unsupportedProviderID: string | undefined
+  /**
+   * 宿主当前会话 id（槽位 render props 传进来的 sessionID，2.0.22 起是 camelCase）。
+   * 探测活跃 provider 时按它精确匹配会话 —— 会话条目里的 model 是「该会话最后用过的
+   * 模型」，靠时间排序猜不出「是哪个会话」（实测 11:33 被两条 deepseek 探针会话带偏）。
+   * ⚠️ 必须声明在 refreshActiveProvider 之前：whenRendererReady 在 renderer 已就绪时
+   * 会**同步**调 run() → load(true) → refreshActiveProvider()，那时若还在 let 的
+   * 暂时性死区里，读它直接抛 ReferenceError（首轮探测被 try/catch 吞掉，白探一轮）。
+   */
+  let currentSessionID: string | undefined
   /** 是否曾经成功探测到过活跃 provider。false 时面板显示「探测中…」而不是拿 GLM 冒充 */
   let hasDetected = false
   let probeInFlight = false
@@ -315,7 +336,8 @@ const tui: TuiPlugin = async (api, options) => {
       const known = getProviders()
         .map((p) => p.id)
         .filter((x): x is string => typeof x === "string" && x !== "")
-      const r = await detectActiveProvider(api, [], known)
+      // 带上当前会话 id：宿主已经告诉我们「是哪个会话」，不必再靠时间排序猜
+      const r = await detectActiveProvider(api, { sessionID: currentSessionID, known })
       r.notes.forEach((n) => trace(`  探测: ${n}`))
       // 探测失败时保留上一次成功的值。之前这里无条件覆盖成 undefined，
       // activeAdapter() 于是回落到 candidates[0]（GLM），面板每 3s 闪一次。
@@ -323,6 +345,28 @@ const tui: TuiPlugin = async (api, options) => {
         trace(`探测未命中，沿用上次结果 ${detectedProviderID ?? "(无，仍显示默认)"}`)
         return
       }
+      // 探测到的 provider 本插件**不支持**（如 Claude），或用户用 providers 白名单把它排除了：
+      // 两者都按「不支持」处理 —— 不覆盖上一次的结果，面板保持上一次的 provider 数据不动。
+      // 覆盖成它会让 activeAdapter() 找不到 adapter、回落到候选列表首个（GLM），
+      // 拿 GLM 的额度冒充当前模型 —— 正是「面板显示的不是我用的模型」那类问题。
+      // 白名单这一条要单独判：candidates() 还叠了「adapter 有可用凭证」的过滤，
+      // 那一条不改（探测到的 provider 一定有凭证，否则它不会出现在会话的 model 里）。
+      const adapter = adapterForProviderId(r.providerID)
+      const excludedByWhitelist =
+        adapter !== undefined &&
+        allowed !== undefined &&
+        allowed.length > 0 &&
+        !allowed.some((n) => n === adapter.id || n === adapter.label)
+      if (!isSupportedProviderID(r.providerID) || excludedByWhitelist) {
+        const why = adapter === undefined ? "本插件不支持" : "被 providers 白名单排除"
+        if (unsupportedProviderID !== r.providerID) {
+          trace(`探测到${why}的 provider ${r.providerID}，保持上次结果 ${detectedProviderID ?? "(无)"}`)
+        }
+        unsupportedProviderID = r.providerID
+        return
+      }
+      // 支持的 provider：清掉「不支持」的记录，正常覆盖
+      unsupportedProviderID = undefined
       if (r.providerID !== detectedProviderID) {
         trace(`活跃 provider: ${detectedProviderID ?? "(无)"} → ${r.providerID}`)
         detectedProviderID = r.providerID
@@ -339,13 +383,19 @@ const tui: TuiPlugin = async (api, options) => {
     const list = candidates()
     const byId = detectedProviderID ? adapterForProviderId(detectedProviderID) : undefined
     if (byId && list.includes(byId)) return byId
+    // ⚠️ 这里的 `if (byId) return byId` 只兜「adapter 存在但当前没有凭证」的情况，
+    // **不是**白名单的漏网之处：providers 白名单的拦截在 refreshActiveProvider 里做 ——
+    // 白名单外的 provider 根本不会被写进 detectedProviderID（按「不支持」处理掉了）。
+    // 在这里回落 candidates[0] 就等于拿别的 provider 的额度冒充当前模型。
     if (byId) return byId
     return list[0]
   }
 
   /** 面板标题：`${provider} Quota`，与参考实现 opencode-glm-vistatus 的 `GLM Quota v1.5.0` 对齐 */
   function panelTitle(): string {
-    // 还没探测到活跃 provider 时不写死 GLM 的名字，否则标题先于数据误导
+    // 还没探测到活跃 provider 时不写死 GLM 的名字，否则标题先于数据误导。
+    // 启动时当前模型就不支持（如一上来就在 Claude 上）也走这条：此时既没有
+    // 可显示的 provider 名，也没有数据可显示，写「套餐 Quota」最中性。
     if (!hasDetected) return "套餐 Quota"
     return `${activeAdapter()?.label ?? "套餐"} Quota`
   }
@@ -408,6 +458,29 @@ const tui: TuiPlugin = async (api, options) => {
         // 每轮取数前先重新探测一次活跃 provider：用户切模型/切会话后能自动跟上
         await refreshActiveProvider()
       }
+      // 当前模型不在本插件支持范围（如 Claude）：这不是查询失败，是「查不了这个 provider」。
+      // 有上一次的 provider 数据 → 保持不动、不发厂商请求；没有 → 显示中性提示。
+      // ⚠️ 这一段必须排在下面的 !hasDetected 之前：启动就不支持时 hasDetected 也是 false，
+      // 先走 !hasDetected 只会显示「探测中…」，中性提示永远轮不到。
+      if (unsupportedProviderID) {
+        if (hasDetected) {
+          trace(
+            `load：当前模型 ${unsupportedProviderID} 不支持，保持上次的 provider 数据不动（不发厂商请求）`,
+          )
+          return true
+        }
+        trace(`load：当前模型 ${unsupportedProviderID} 不支持，显示中性提示`)
+        setSnapshot({
+          provider: unsupportedProviderID,
+          ok: false,
+          error: "",
+          unsupported: unsupportedProviderID,
+          fetchedAt: now,
+        })
+        // 排一轮重试：用户随时可能切回支持的模型，重试能让面板第一时间跟上
+        scheduleRetry()
+        return true
+      }
       // 还没探测到过活跃 provider：什么都不取，只显示「探测中…」。
       // 否则 activeAdapter() 会回落到候选列表首个（GLM），把 GLM 的数据
       // 冒充成当前 provider 显示——启动头几秒会闪一次 GLM。
@@ -459,8 +532,8 @@ const tui: TuiPlugin = async (api, options) => {
     }
   }
 
-  // 槽位 props 里的 sessionID 决定「当前 provider」，由宿主在切换会话时重新调用
-  let sessionID: string | undefined
+  // 槽位 props 里的 sessionID 决定「当前 provider」（值存在 currentSessionID 里），
+  // 由宿主在切换会话时重新调用 render
   const kv = resolveKV(api)
   let renderCount = 0
   const render = (slotProps?: unknown): unknown => {
@@ -473,12 +546,13 @@ const tui: TuiPlugin = async (api, options) => {
         ? props.sessionID
         : typeof props?.session_id === "string"
           ? props.session_id
-          : sessionID
+          : currentSessionID
     // 每次 render 都打一行带计数的 trace：宿主到底调了几次 render，日志要能对上。
     trace(`render #${renderCount} session=${next ?? "(none)"}`)
-    if (next !== sessionID) {
-      sessionID = next
+    if (next !== currentSessionID) {
+      currentSessionID = next
       setTitle(panelTitle())
+      // 切会话时靠这条链路让面板跟着切：sessionID 变了 → 重新探测 → 重新取数
       void load(true)
     }
     // 必须在宿主的响应式 owner 内实例化；直接调 QuotaPanel({...}) 不建 owner，组件不渲染（实测踩过）。
@@ -554,9 +628,13 @@ const tui: TuiPlugin = async (api, options) => {
     void (async () => {
       if (stopped) return
       const before = detectedProviderID
+      // 记住刷新前是不是「不支持」状态：从 Claude 切回支持的 provider 时，
+      // detectedProviderID 不会变（覆盖策略是保持上次结果），但面板该立刻恢复，
+      // 所以把「从不支持切回支持」也算作一次变化。
+      const wasUnsupported = unsupportedProviderID !== undefined
       await refreshActiveProvider()
       if (stopped) return
-      if (detectedProviderID !== before) {
+      if (detectedProviderID !== before || (wasUnsupported && !unsupportedProviderID)) {
         setTitle(panelTitle())
         // load 被跳过（慢请求在飞）的话这次切换就丢了，补一轮阶梯重试
         if (!load(true, { providerID: detectedProviderID })) {

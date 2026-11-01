@@ -317,6 +317,10 @@ export function QuotaPanel(props: QuotaPanelProps): JSX.Element {
     // 活跃 provider 还没探测到：这不是查询失败，是还没开始查。两者必须区分，
     // 否则启动头几秒会拿候选列表首个（GLM）的额度冒充当前 provider。
     if (s.detecting) return <Notice icon=">" text="探测当前 provider…" fg={pal().muted} />
+    // 当前模型不在本插件支持范围（如 Claude）：这不是查询失败，是「查不了这个 provider」，
+    // 所以给中性提示而不是红色报错。判断必须排在 !s.ok 前面 —— 这两种快照的 ok 都是 false。
+    if (s.unsupported)
+      return <Notice icon=">" text={`当前模型 ${s.unsupported} 不在本插件支持范围`} fg={pal().muted} />
     if (!s.ok) return <Notice icon="⚠" text={s.error ?? "查询失败"} fg={pal().error} />
     const q = s.quota
     if (!q) return <Notice icon=">" text="暂无数据" fg={pal().muted} />

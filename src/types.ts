@@ -37,6 +37,12 @@ export type QuotaSnapshot = {
    * 避免启动头几秒拿候选列表首个（GLM）的数据冒充当前 provider。
    */
   detecting?: boolean
+  /**
+   * 探测到的当前模型不在本插件支持范围（如 Claude）时的 providerID。
+   * 与 detecting / ok=false 区分开：这不是查询失败，是「这个 provider 本插件查不了」，
+   * 所以面板显示中性提示而不是红色报错；有上一次可保持的数据时则保持不动，不显示此提示。
+   */
+  unsupported?: string
 }
 
 /** 宿主 provider 条目的最小形状（运行时逐字段收窄，不信任 SDK 类型） */

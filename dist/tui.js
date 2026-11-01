@@ -43,7 +43,7 @@ function rankSessions(list) {
     if (!score) continue;
     cands.push({ s, t: score.t, by: score.by, tier: score.tier });
   }
-  cands.sort((a, b) => b.tier - a.tier || b.t - a.t);
+  cands.sort((a, b) => a.tier - b.tier || b.t - a.t);
   return cands;
 }
 function pickMostViewedSession(list) {
@@ -117,50 +117,155 @@ function providerIDFromMessages(payload, known) {
   }
   return void 0;
 }
-async function detectActiveProvider(api, preferIDs = [], known = []) {
+function errText(e) {
+  return e instanceof Error ? e.message.split("\n")[0] : "?";
+}
+function isThenable(v) {
+  return typeof v === "object" && v !== null && typeof v.then === "function";
+}
+var SESSION_WRITE_PREFIXES = [
+  "set",
+  "update",
+  "delete",
+  "remove",
+  "abort",
+  "cancel",
+  "write",
+  "create",
+  "move",
+  "rename",
+  "archive",
+  "restore",
+  "revert",
+  "clear",
+  "reset",
+  "start",
+  "stop",
+  "run",
+  "execute",
+  "submit"
+];
+function isWriteLikeKey(key) {
+  const k = key.toLowerCase();
+  return SESSION_WRITE_PREFIXES.some((p) => k.startsWith(p));
+}
+async function detectActiveProvider(api, opts = {}) {
   const notes = [];
-  for (const id of preferIDs) {
-    if (typeof id === "string" && id !== "") {
-      notes.push(`render props \u76F4\u63A5\u7ED9\u51FA ${id}`);
-      return { providerID: id, notes };
-    }
-  }
+  const known = opts.known ?? [];
   const a = rec(api) ?? {};
   const ui = rec(a.ui) ?? {};
   const client = rec(a.client) ?? {};
   const uiModel = rec(ui.model) ?? {};
   for (const key of ["current", "selected", "active", "value"]) {
-    const id = pickProviderIDFromModelLike(uiModel[key], known);
+    const v = uiModel[key];
+    if (v === void 0) continue;
+    const isFn = typeof v === "function";
+    let r = v;
+    if (isFn) {
+      try {
+        r = v.call(uiModel);
+      } catch {
+        continue;
+      }
+      if (isThenable(r)) continue;
+    }
+    const id = pickProviderIDFromModelLike(r, known);
     if (id) {
-      notes.push(`api.ui.model.${key} \u2192 ${id}`);
+      notes.push(isFn ? `api.ui.model.${key}() \u2192 ${id}` : `api.ui.model.${key} \u2192 ${id}`);
       return { providerID: id, notes };
     }
   }
-  const sessionNS = rec(client.session) ?? {};
-  const listFn = sessionNS.list;
-  if (typeof listFn === "function") {
-    try {
-      const list = await listFn.call(sessionNS);
-      const arr = Array.isArray(list) ? list : rec(list)?.data ?? [];
-      const best = pickMostViewedSession(arr);
-      const id = pickProviderIDFromModelLike(best?.session, known);
-      if (id) {
-        const top = rankSessions(arr).slice(0, 3).map((x) => `${String(x.s.id ?? "?").slice(-6)}:${x.tier === 1 ? "" : "\u515C\u5E95:"}${x.by}=${x.t}`).join(" ");
+  const SESSION_LIST_LIMIT = 200;
+  let listPromise;
+  const fetchSessionList = () => {
+    if (listPromise) return listPromise;
+    listPromise = (async () => {
+      const sessionNS = rec(client.session) ?? {};
+      const listFn = sessionNS.list;
+      if (typeof listFn !== "function") return void 0;
+      const shape = (res) => {
+        if (Array.isArray(res)) return res;
+        const data = rec(res)?.data;
+        return Array.isArray(data) ? data : void 0;
+      };
+      try {
+        const res = await listFn.call(sessionNS, { limit: SESSION_LIST_LIMIT });
+        const arr2 = shape(res);
+        if (arr2 && arr2.length > 0) {
+          notes.push(`\u4F1A\u8BDD\u5217\u8868\uFF1Aclient.session.list(limit=${SESSION_LIST_LIMIT}) \u2192 ${arr2.length} \u6761`);
+          return arr2;
+        }
         notes.push(
-          `client.session.list() ${arr.length} \u6761 \u2192 \u5F53\u524D\u4F1A\u8BDD \u2026${best?.id?.slice(-6)} (${best?.rankBy}) \u2192 ${id} | top3 ${top}`
+          arr2 ? `\u4F1A\u8BDD\u5217\u8868\uFF1Aclient.session.list(limit=${SESSION_LIST_LIMIT}) \u8FD4\u56DE\u7A7A\uFF0C\u518D\u8BD5\u65E0\u53C2\u8C03\u7528` : "\u4F1A\u8BDD\u5217\u8868\uFF1A\u5E26 limit \u8C03\u7528\u8FD4\u56DE\u5F62\u72B6\u5F02\u5E38\uFF0C\u518D\u8BD5\u65E0\u53C2\u8C03\u7528"
         );
-        return { providerID: id, notes };
+      } catch (e) {
+        notes.push(`\u4F1A\u8BDD\u5217\u8868\uFF1A\u5E26 limit \u8C03\u7528\u629B\u5F02\u5E38\uFF08${errText(e)}\uFF09\uFF0C\u9000\u56DE\u65E0\u53C2\u8C03\u7528`);
       }
-      notes.push(`client.session.list() ${arr.length} \u6761\u91CC\u6CA1\u6709 model \u5B57\u6BB5\uFF08keys=${keyList(best?.session)}\uFF09`);
-    } catch (e) {
-      notes.push(`client.session.list \u629B\u5F02\u5E38: ${e instanceof Error ? e.message.split("\n")[0] : "?"}`);
+      try {
+        const res = await listFn.call(sessionNS);
+        const arr2 = shape(res);
+        if (arr2) {
+          notes.push(`\u4F1A\u8BDD\u5217\u8868\uFF1Aclient.session.list \u65E0\u53C2\u515C\u5E95 \u2192 ${arr2.length} \u6761`);
+          return arr2;
+        }
+        notes.push("\u4F1A\u8BDD\u5217\u8868\uFF1A\u65E0\u53C2\u8C03\u7528\u8FD4\u56DE\u5F62\u72B6\u5F02\u5E38");
+      } catch (e) {
+        notes.push(`client.session.list \u629B\u5F02\u5E38: ${errText(e)}`);
+      }
+      return void 0;
+    })();
+    return listPromise;
+  };
+  const wantID = typeof opts.sessionID === "string" ? opts.sessionID.trim() : "";
+  if (wantID !== "") {
+    const arr2 = await fetchSessionList();
+    if (!arr2) {
+      notes.push("\u7CBE\u786E\u5339\u914D\u672A\u547D\u4E2D\uFF1Asession.list() \u53D6\u4E0D\u5230\u4F1A\u8BDD\u5217\u8868");
+    } else {
+      let hit;
+      for (const item of arr2) {
+        const s = rec(item);
+        if (!s) continue;
+        const sid = s.id;
+        if (sid === void 0 || sid === null) continue;
+        if (String(sid) === wantID) {
+          hit = s;
+          break;
+        }
+      }
+      if (!hit) {
+        notes.push(`\u7CBE\u786E\u5339\u914D\u672A\u547D\u4E2D\uFF1Asession.list() \u91CC\u6CA1\u6709\u8BE5 session\uFF08\u2026${wantID.slice(-6)}\uFF09`);
+      } else {
+        const id = pickProviderIDFromModelLike(hit, known);
+        if (id) {
+          notes.push(`client.session.list() \u7CBE\u786E\u5339\u914D session=\u2026${wantID.slice(-6)} \u2192 ${id}`);
+          return { providerID: id, notes };
+        }
+        notes.push(
+          `\u7CBE\u786E\u5339\u914D\u547D\u4E2D\u4F46\u6CA1\u6709 model \u5B57\u6BB5\uFF08session=\u2026${wantID.slice(-6)}\uFF0Ckeys=${keyList(hit)}\uFF09`
+        );
+      }
     }
+  }
+  const arr = await fetchSessionList();
+  if (arr) {
+    const best = pickMostViewedSession(arr);
+    const id = pickProviderIDFromModelLike(best?.session, known);
+    if (id) {
+      const top = rankSessions(arr).slice(0, 3).map((x) => `${String(x.s.id ?? "?").slice(-6)}:${x.tier === 1 ? "" : "\u515C\u5E95:"}${x.by}=${x.t}`).join(" ");
+      notes.push(
+        `client.session.list() ${arr.length} \u6761 \u2192 \u5F53\u524D\u4F1A\u8BDD \u2026${best?.id?.slice(-6)} (${best?.rankBy}) \u2192 ${id} | top3 ${top}`
+      );
+      return { providerID: id, notes };
+    }
+    notes.push(`client.session.list() ${arr.length} \u6761\u91CC\u6CA1\u6709 model \u5B57\u6BB5\uFF08keys=${keyList(best?.session)}\uFF09`);
   }
   try {
     const dataSession = rec(rec(a.data)?.session) ?? {};
     for (const key of Object.keys(dataSession)) {
       const v = dataSession[key];
       if (typeof v !== "function" || key === "get" || key === "select") continue;
+      if (isWriteLikeKey(key)) continue;
       let r;
       try {
         r = await v.call(dataSession);
@@ -179,12 +284,12 @@ async function detectActiveProvider(api, preferIDs = [], known = []) {
   }
   try {
     const modelNS = rec(client.model) ?? {};
-    const listFn2 = modelNS.list ?? modelNS.available;
-    if (typeof listFn2 === "function") {
-      const list = await listFn2.call(modelNS);
-      const arr = Array.isArray(list) ? list : [];
+    const listFn = modelNS.list ?? modelNS.available;
+    if (typeof listFn === "function") {
+      const list = await listFn.call(modelNS);
+      const arr2 = Array.isArray(list) ? list : [];
       const ids = /* @__PURE__ */ new Set();
-      for (const m of arr) {
+      for (const m of arr2) {
         const id = pickProviderIDFromModelLike(m, known);
         if (id) ids.add(id);
       }
@@ -947,6 +1052,9 @@ function nonEmpty(s) {
 function adapterForProviderId(providerId) {
   return PROVIDERS.find((a) => a.match({ id: providerId }));
 }
+function isSupportedProviderID(providerID) {
+  return adapterForProviderId(providerID) !== void 0;
+}
 function fetchQuota(adapter, providers) {
   const p = pickProvider(providers, adapter.match, adapter.prefer);
   if (!p) throw new Error(`\u672A\u627E\u5230 ${adapter.label} \u7684 provider \u914D\u7F6E\uFF08host provider \u5217\u8868\u91CC\u6CA1\u6709\u53EF\u5339\u914D\u6761\u76EE\uFF09`);
@@ -1578,6 +1686,15 @@ function QuotaPanel(props) {
         return pal().muted;
       }
     });
+    if (s.unsupported) return _$createComponent(Notice, {
+      icon: ">",
+      get text() {
+        return `\u5F53\u524D\u6A21\u578B ${s.unsupported} \u4E0D\u5728\u672C\u63D2\u4EF6\u652F\u6301\u8303\u56F4`;
+      },
+      get fg() {
+        return pal().muted;
+      }
+    });
     if (!s.ok) return _$createComponent(Notice, {
       icon: "\u26A0",
       get text() {
@@ -1774,7 +1891,7 @@ function resolveKV(api) {
 }
 
 // main.ts
-var PLUGIN_VERSION = "0.1.0";
+var PLUGIN_VERSION = "0.1.1";
 var TRACE_ENABLED = process.env.OPENCODE_QUOTA_SWITCH_TRACE !== void 0 && process.env.OPENCODE_QUOTA_SWITCH_TRACE !== "";
 var TRACE_MAX_BYTES = 512 * 1024;
 var TRACE_FILE = path3.join(os3.homedir(), ".local", "state", "opencode", "quota-switch.log");
@@ -1987,6 +2104,8 @@ var tui = async (api, options) => {
     const [snapshot, setSnapshot] = createSignal2(null);
     const [title, setTitle] = createSignal2(opts.title ?? "\u5957\u9910\u7528\u91CF");
     let detectedProviderID;
+    let unsupportedProviderID;
+    let currentSessionID;
     let hasDetected = false;
     let probeInFlight = false;
     async function refreshActiveProvider() {
@@ -1994,12 +2113,23 @@ var tui = async (api, options) => {
       probeInFlight = true;
       try {
         const known = getProviders().map((p) => p.id).filter((x) => typeof x === "string" && x !== "");
-        const r = await detectActiveProvider(api, [], known);
+        const r = await detectActiveProvider(api, { sessionID: currentSessionID, known });
         r.notes.forEach((n) => trace(`  \u63A2\u6D4B: ${n}`));
         if (r.providerID === void 0) {
           trace(`\u63A2\u6D4B\u672A\u547D\u4E2D\uFF0C\u6CBF\u7528\u4E0A\u6B21\u7ED3\u679C ${detectedProviderID ?? "(\u65E0\uFF0C\u4ECD\u663E\u793A\u9ED8\u8BA4)"}`);
           return;
         }
+        const adapter = adapterForProviderId(r.providerID);
+        const excludedByWhitelist = adapter !== void 0 && allowed !== void 0 && allowed.length > 0 && !allowed.some((n) => n === adapter.id || n === adapter.label);
+        if (!isSupportedProviderID(r.providerID) || excludedByWhitelist) {
+          const why = adapter === void 0 ? "\u672C\u63D2\u4EF6\u4E0D\u652F\u6301" : "\u88AB providers \u767D\u540D\u5355\u6392\u9664";
+          if (unsupportedProviderID !== r.providerID) {
+            trace(`\u63A2\u6D4B\u5230${why}\u7684 provider ${r.providerID}\uFF0C\u4FDD\u6301\u4E0A\u6B21\u7ED3\u679C ${detectedProviderID ?? "(\u65E0)"}`);
+          }
+          unsupportedProviderID = r.providerID;
+          return;
+        }
+        unsupportedProviderID = void 0;
         if (r.providerID !== detectedProviderID) {
           trace(`\u6D3B\u8DC3 provider: ${detectedProviderID ?? "(\u65E0)"} \u2192 ${r.providerID}`);
           detectedProviderID = r.providerID;
@@ -2030,6 +2160,24 @@ var tui = async (api, options) => {
           trace(`load\uFF1A\u590D\u7528\u8C03\u7528\u65B9\u5DF2\u63A2\u7ED3\u679C provider=${probed.providerID ?? "(\u672A\u547D\u4E2D)"}`);
         } else {
           await refreshActiveProvider();
+        }
+        if (unsupportedProviderID) {
+          if (hasDetected) {
+            trace(
+              `load\uFF1A\u5F53\u524D\u6A21\u578B ${unsupportedProviderID} \u4E0D\u652F\u6301\uFF0C\u4FDD\u6301\u4E0A\u6B21\u7684 provider \u6570\u636E\u4E0D\u52A8\uFF08\u4E0D\u53D1\u5382\u5546\u8BF7\u6C42\uFF09`
+            );
+            return true;
+          }
+          trace(`load\uFF1A\u5F53\u524D\u6A21\u578B ${unsupportedProviderID} \u4E0D\u652F\u6301\uFF0C\u663E\u793A\u4E2D\u6027\u63D0\u793A`);
+          setSnapshot({
+            provider: unsupportedProviderID,
+            ok: false,
+            error: "",
+            unsupported: unsupportedProviderID,
+            fetchedAt: now
+          });
+          scheduleRetry2();
+          return true;
         }
         if (!hasDetected) {
           trace("load\uFF1A\u6D3B\u8DC3 provider \u5C1A\u672A\u63A2\u6D4B\u5230\uFF0C\u663E\u793A\u63A2\u6D4B\u4E2D");
@@ -2075,16 +2223,15 @@ var tui = async (api, options) => {
         inFlight = false;
       }
     }
-    let sessionID;
     const kv = resolveKV(api);
     let renderCount = 0;
     const render = (slotProps) => {
       renderCount += 1;
       const props = asRecord2(slotProps);
-      const next = typeof props?.sessionID === "string" ? props.sessionID : typeof props?.session_id === "string" ? props.session_id : sessionID;
+      const next = typeof props?.sessionID === "string" ? props.sessionID : typeof props?.session_id === "string" ? props.session_id : currentSessionID;
       trace(`render #${renderCount} session=${next ?? "(none)"}`);
-      if (next !== sessionID) {
-        sessionID = next;
+      if (next !== currentSessionID) {
+        currentSessionID = next;
         setTitle(panelTitle2());
         void load2(true);
       }
@@ -2132,9 +2279,10 @@ var tui = async (api, options) => {
       void (async () => {
         if (stopped) return;
         const before = detectedProviderID;
+        const wasUnsupported = unsupportedProviderID !== void 0;
         await refreshActiveProvider();
         if (stopped) return;
-        if (detectedProviderID !== before) {
+        if (detectedProviderID !== before || wasUnsupported && !unsupportedProviderID) {
           setTitle(panelTitle2());
           if (!load2(true, { providerID: detectedProviderID })) {
             trace("watchTimer\uFF1A\u672C\u6B21 load \u88AB\u8DF3\u8FC7\uFF0C\u6392\u4E00\u8F6E\u91CD\u8BD5");

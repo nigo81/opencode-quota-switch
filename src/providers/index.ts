@@ -53,6 +53,15 @@ export function adapterForProviderId(providerId: string): ProviderAdapter | unde
   return PROVIDERS.find((a) => a.match({ id: providerId }))
 }
 
+/**
+ * 该 providerID 是否是本插件支持的 provider（能映射到某个 adapter）。
+ * 用来区分「探测到的 provider 支持」与「探测到了但不支持（如 Claude）」——
+ * 后者不能回落到候选列表首个（那会拿 GLM 的额度冒充当前模型）。
+ */
+export function isSupportedProviderID(providerID: string): boolean {
+  return adapterForProviderId(providerID) !== undefined
+}
+
 /** 挑出最合适的宿主 provider 条目并抓取配额；没有匹配条目时抛中文错误由 UI 展示 */
 export function fetchQuota(adapter: ProviderAdapter, providers: readonly ProviderLike[]): Promise<ProviderQuota> {
   const p = pickProvider(providers, adapter.match, adapter.prefer)
